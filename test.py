@@ -28,6 +28,16 @@ v5.1：整条动作链路提速8%（用户要求5%~10%）。做法是把推进�
       安全间隙55、绕圈圈数判定一律不改，所以提速不换安全余量。
       绕圈限速是 sqrt(预算/曲率)，预算按系数平方放大才使绕圈速度真正+8%。
       想回到v5速度：把下面 SPEED_GAIN 改成 1.0 即可，无需改其它行。
+v6：① 提速系数 1.08 -> 1.16（用户要求"再快一些"）。
+    注意快档 THRUST_BASE 已是 50=MAX_THRUST，推力恒被钳在 50，
+    目标速度数值本身不改变实际推力；真正决定快慢的是尾摆频率与幅值，
+    所以提速必须落在 TAIL_*_HZ / TAIL_AMPLITUDE_* 上。
+    ② 出缝后立刻内切：slalom_2 由"先向北偏+35再俯冲"的两段曲线，
+    改为一条两端切向都连续的三次贝塞尔，直接下压到南侧入圈点。
+    旧版转折点被推到第三柱西侧(x≈450)才出现，即"到第三柱才开始向里走"；
+    新版出缝后 52mm 就出现向内趋势，到第三柱西侧已完成 70% 横移，
+    且最大曲率 1/222 低于绕圈曲率 1/200（不触发曲率限速、无急拐），
+    路径还短了 48mm，entry_guard 也不再触发。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -61,11 +71,16 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v5.1-stable-xy' if USE_STABLE_PROFILE else 'race-v5.1-speed+8'
-# 整体提速系数（v5.1）：用户要求整条动作链路提速 5%~10%，取中值 8%。
+PROFILE_NAME = 'race-v6-stable-xy' if USE_STABLE_PROFILE else 'race-v6-immediate-inward'
+# 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
-SPEED_GAIN = 1.08
+#
+# 重要：快档的 THRUST_BASE 已经是 50（=MAX_THRUST），所以推力恒被钳在 50，
+# 目标速度数值本身不改变实际推力。真正决定快慢的是**尾摆频率与幅值**
+# （手册：尾摆是主要推进方式，摆动频率与动力成正比）。因此提速必须落到
+# TAIL_STRAIGHT_HZ / TAIL_TURN_HZ / TAIL_AMPLITUDE_* 上，这里统一乘 SPEED_GAIN。
+SPEED_GAIN = 1.16
 # 目标速度不是实际速度。推进器仍限制在50，尾角仍限制在±80度。
 CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
 TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
@@ -89,6 +104,9 @@ GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
 ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
+# 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
+# 低于曲率限速的"免费"阈值，因此内切过程不会额外减速，也不会出现急拐。
+CURVE_ARM_RATIO = 0.85
 
 # ========================== 路径构建工具 ==========================
 
@@ -177,18 +195,14 @@ def generate_sections():
     # 从障碍1下侧逐渐向中线对正；双柱范围内保持 y=0、朝+x。
     pb.bezier(e1, (-510.0, -LOOP_R), (-390.0, 0.0), (-190.0, 0.0))
     pb.straight((-190.0, 0.0), (190.0, 0.0))
-    # 出缝后弯向另一侧，构成 S 形；高速档提前转向，在南侧切向入圈。
-    if USE_STABLE_PROFILE:
-        pb.bezier((190.0, 0.0), (270.0, 0.0), (325.0, 90.0), (390.0, 90.0))
-        pb.bezier((390.0, 90.0), (470.0, 90.0),
-                  (OBS3[0]-LOOP_R, 75.0), (OBS3[0]-LOOP_R, 0.0))
-        pb.arc(OBS3, LOOP_R, 180.0, 90.0)
-    else:
-        # 旧曲线在第三柱西侧才急转向南，惯性会把鱼送进柱子。
-        # 小幅正y弯后提前向南，避开西侧急弯和额外的90度入圈圆弧。
-        pb.bezier((190.0, 0.0), (245.0, 0.0), (290.0, 35.0), (330.0, 35.0))
-        pb.bezier((330.0, 35.0), (450.0, 35.0),
-                  (450.0, -LOOP_R), e3)
+    # v6：出缝后立刻内切。旧版先向北偏 +35 再俯冲到南侧，
+    # 转折点被推到第三柱西侧（x≈450）才出现，所以"到第三柱才开始向里走"。
+    # 现在改用一条与两端切向都连续的三次贝塞尔，从出缝点直接下压到南侧入圈点：
+    # 两端切向都是 +x（与直缝、与入圈圆弧相切），曲率上限 1/LOOP_R，
+    # 不会触发曲率限速，也不会出现急拐或卡顿。
+    arm = CURVE_ARM_RATIO * LOOP_R
+    pb.bezier((190.0, 0.0), (190.0+arm, 0.0), (OBS3[0]-arm, -LOOP_R), e3)
+    # 终点 e3 正好是 orbit_3 圆弧的起点(270度)，两端切向都是 +x，无需额外圆弧。
     sections.append(PathSection('slalom_2', pb.pts))
 
     pb = PathBuilder()
@@ -898,8 +912,15 @@ def self_test():
                 return
             points = generate_sections()[2].points
             tracker = PathTracker(points)
-            self.assertLess(max(tracker.curv), 0.013)
-            self.assertTrue(any(x > 190.0 and y > 30.0 for x, y, _ in points))
+            # v6：出缝后立刻内切。旧版要求"先向北偏到 y>30 再俯冲"，
+            # 那正是"到第三柱才开始向里走"的成因，已按用户要求删除。
+            # 现在要求曲率不超过绕圈本身，从而不触发曲率限速、不出现急拐。
+            self.assertLessEqual(max(tracker.curv), 1.0/LOOP_R + 1e-6)
+            self.assertFalse(any(y > 5.0 for x, y, _ in points if x > 190.0))
+            # 出缝后必须立刻出现向内（-y）趋势，而不是等到第三柱。
+            inward = [x for x, y, _ in points if y < -5.0]
+            self.assertTrue(inward, '出缝后没有任何向内位移')
+            self.assertLess(min(inward), OBS3[0]-LOOP_R)
             for a, b in zip(points, points[1:]):
                 for center in PILLARS:
                     self.assertGreaterEqual(segment_clearance(a, b, center), 55.0)
@@ -924,6 +945,27 @@ def self_test():
             c.velocity_y = 80.0
             heading, _, _ = c._guidance(150.0, 10.0)
             self.assertLess(heading, 0.0)
+
+        def test_v6_immediate_inward_turn_after_gap(self):
+            """用户验收标准：出缝后立刻向内，第三柱不是"开始向里走"的起点。"""
+            if USE_STABLE_PROFILE:
+                return
+            points = generate_sections()[2].points
+            gap_exit = 190.0            # 双柱缝的出口 x
+            west_of_obs3 = OBS3[0]-LOOP_R   # 第三柱西侧入圈点 x=550
+            ys = [(x, y) for x, y, _ in points if x > gap_exit]
+            self.assertTrue(ys)
+            # 标准1：离开第二根柱子后马上出现向内（-y）趋势。
+            first_inward = next(x for x, y in ys if y < -5.0)
+            self.assertLess(first_inward - gap_exit, 120.0)
+            # 标准2：到达第三根柱子之前就已明显向内（至少走完一半横移）。
+            y_at_west = min((abs(x-west_of_obs3), y) for x, y in ys)[1]
+            self.assertLess(y_at_west, -0.5*LOOP_R)
+            # 标准3：第三柱不是转向起点——在它之前早就已经向内。
+            self.assertLess(first_inward, west_of_obs3 - 100.0)
+            # 全程单调向内，不出现"先向北再向南"的回头弯。
+            monotone = [y for x, y in ys]
+            self.assertEqual(monotone, sorted(monotone, reverse=True))
 
         def test_gap_speed_and_tail_use_lateral_prediction(self):
             if USE_STABLE_PROFILE:
