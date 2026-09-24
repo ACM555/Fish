@@ -1,0 +1,11 @@
+# 仿真器本体（755MB 二进制，不要提交到 GitHub）
+WindowsNoEditor/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 本地临时文件
+*.log
+.DS_Store
+Thumbs.db
