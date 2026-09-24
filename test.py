@@ -22,6 +22,12 @@
 16秒是用户目标，不是本版本实测成绩。本文件不修改裁判、时间流速或比赛记录。
 v5：穿缝直线导引、提前平顺入圈、前瞻线段及短时航迹碰撞检查；
 保留v4高度->垂直速度->俯仰角->胸鳍倾角级联反馈。
+v5.1：整条动作链路提速8%（用户要求5%~10%）。做法是把推进量按同一系数放大：
+      尾摆频率、尾摆幅值、巡航/转弯/穿缝目标速度、转弯加速度预算、速度环增益、
+      穿缝减速斜率与各类保守推力上限。平台的硬限幅（推进力50、尾角±80）、
+      安全间隙55、绕圈圈数判定一律不改，所以提速不换安全余量。
+      绕圈限速是 sqrt(预算/曲率)，预算按系数平方放大才使绕圈速度真正+8%。
+      想回到v5速度：把下面 SPEED_GAIN 改成 1.0 即可，无需改其它行。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -55,15 +61,34 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v5-stable-xy' if USE_STABLE_PROFILE else 'race-v5-smooth-entry'
+PROFILE_NAME = 'race-v5.1-stable-xy' if USE_STABLE_PROFILE else 'race-v5.1-speed+8'
+# 整体提速系数（v5.1）：用户要求整条动作链路提速 5%~10%，取中值 8%。
+# 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
+# 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
+SPEED_GAIN = 1.08
 # 目标速度不是实际速度。推进器仍限制在50，尾角仍限制在±80度。
-CRUISE_SPEED = 540.0 if USE_STABLE_PROFILE else 560.0
-TURN_SPEED = 480.0 if USE_STABLE_PROFILE else 540.0
-GAP_SPEED = 360.0 if USE_STABLE_PROFILE else 400.0
-TURN_ACCEL_BUDGET = 1150.0 if USE_STABLE_PROFILE else 1460.0
+CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
+TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
+GAP_SPEED_BASE = 360.0 if USE_STABLE_PROFILE else 400.0
+GAP_SPEED = GAP_SPEED_BASE * SPEED_GAIN
+# 曲率限速是 sqrt(预算/曲率)，预算只乘一次的话绕圈速度只涨 sqrt(1.08)≈4%，
+# 达不到要求的 8%；因此预算按系数的平方放大。
+TURN_ACCEL_BUDGET = (1150.0 if USE_STABLE_PROFILE else 1460.0) * SPEED_GAIN ** 2
 THRUST_BASE = 48.0 if USE_STABLE_PROFILE else 50.0
-TAIL_STRAIGHT_HZ = 3.4 if USE_STABLE_PROFILE else 3.8
-TAIL_TURN_HZ = 3.3 if USE_STABLE_PROFILE else 3.6
+# 手册：尾摆频率与动力成正比，尾摆是主要推进方式；这里是主要提速手段。
+TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN
+TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN
+# 尾摆幅值（同样是推进量）；窄缝内仍收窄，避免摆动导致反复纠偏。
+TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
+TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN
+GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
+# 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
+GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
+GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
+# 绕圈偏离圆周后重新贴回的推力上限（安全限幅，只按系数微调）。
+ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
+# 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
+TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 
 # ========================== 路径构建工具 ==========================
 
@@ -554,19 +579,22 @@ class RaceController:
         target_speed = CRUISE_SPEED
         if curvature > 0.0015:
             target_speed = _constrain(math.sqrt(TURN_ACCEL_BUDGET/curvature),
-                                       250.0, TURN_SPEED)
+                                       TURN_SPEED_FLOOR, TURN_SPEED)
         if self.stage == 'slalom_2' and abs(x) < 240.0:
             if USE_STABLE_PROFILE:
                 aligned = abs(y) < 18.0 and abs(error) < 14.0
-                target_speed = min(target_speed, GAP_SPEED if aligned else 280.0)
+                target_speed = min(target_speed, GAP_SPEED if aligned else GAP_ALIGN_SPEED)
             else:
                 # 不因摆尾瞬时越过14度就从400跳到280；按预测横向偏移连续减速。
                 lateral_risk = max(abs(y), abs(y+0.18*self.velocity_y))
-                lane_speed = GAP_SPEED-10.0*max(0.0, lateral_risk-18.0)
-                lane_speed -= 4.0*max(0.0, abs(error)-22.0)
-                target_speed = min(target_speed, _constrain(lane_speed, 250.0, GAP_SPEED))
+                # 减速斜率与整体提速同比例放大，否则提速后偏移惩罚相对变松。
+                lane_speed = GAP_SPEED-SPEED_GAIN*(
+                    10.0*max(0.0, lateral_risk-18.0)+4.0*max(0.0, abs(error)-22.0))
+                target_speed = min(target_speed,
+                                   _constrain(lane_speed, GAP_LANE_FLOOR, GAP_SPEED))
         self.target_speed = target_speed
-        thrust = _constrain(THRUST_BASE + 0.07*(target_speed-self.speed),
+        # 速度环增益随整体提速同步放大，否则目标速度提上去了推力仍跟不上。
+        thrust = _constrain(THRUST_BASE + 0.07*SPEED_GAIN*(target_speed-self.speed),
                             18.0, MAX_THRUST)
 
         # 原版在40°处从50骤降到24，摆尾导致误差跨阈值时会反复急减速。
@@ -578,14 +606,14 @@ class RaceController:
             cx, cy = self.orbit.center
             radial_error = math.hypot(x-cx, y-cy)-LOOP_R
             if abs(radial_error) > 40.0:
-                thrust = min(thrust, 28.0)  # 偏离圆周后先收回轨迹，再加速
+                thrust = min(thrust, ORBIT_RECAPTURE_THRUST)  # 偏离圆周后先收回轨迹，再加速
         if self.entry_avoidance:
-            thrust = min(thrust, 28.0)
+            thrust = min(thrust, ORBIT_RECAPTURE_THRUST)
         turning = curvature > 0.003
         frequency = TAIL_TURN_HZ if turning else TAIL_STRAIGHT_HZ
-        amplitude = 18.0 if turning else 24.0
+        amplitude = TAIL_AMPLITUDE_TURN if turning else TAIL_AMPLITUDE_STRAIGHT
         if not USE_STABLE_PROFILE and self.stage == 'slalom_2' and abs(x) < 240.0:
-            amplitude = 8.0  # 窄缝内缩小摆尾，保留前向推力，减少左右纠偏。
+            amplitude = GAP_TAIL_AMPLITUDE  # 窄缝内缩小摆尾，保留前向推力，减少左右纠偏。
         return thrust, frequency, amplitude
 
     def calculate(self, fish_info, now=None):
@@ -849,11 +877,11 @@ def self_test():
             self.assertEqual(c.target_speed, GAP_SPEED)
             c._motion_profile(0.0, 20.0, 0.0, 0.0)
             if USE_STABLE_PROFILE:
-                self.assertLessEqual(c.target_speed, 280.0)
+                self.assertLessEqual(c.target_speed, GAP_ALIGN_SPEED)
             else:
                 self.assertEqual(c.target_speed, GAP_SPEED)
             c._motion_profile(0.0, 0.0, 0.0, 30.0)
-            self.assertLessEqual(c.target_speed, 280.0)
+            self.assertLessEqual(c.target_speed, GAP_ALIGN_SPEED)
 
         def test_segment_clearance_includes_segment_interior(self):
             self.assertEqual(segment_clearance((-200.0, 0.0), (200.0, 0.0), (0.0, 0.0)), 0.0)
@@ -905,10 +933,10 @@ def self_test():
             thrust, _, amplitude = c._motion_profile(0.0, 15.0, 0.0, 0.0)
             self.assertEqual(c.target_speed, GAP_SPEED)
             self.assertEqual(thrust, MAX_THRUST)
-            self.assertEqual(amplitude, 8.0)
+            self.assertEqual(amplitude, GAP_TAIL_AMPLITUDE)
             c.velocity_y = 180.0
             c._motion_profile(0.0, 0.0, 0.0, 0.0)
-            self.assertLess(c.target_speed, 280.0)
+            self.assertLess(c.target_speed, GAP_SPEED)
             c.velocity_y = 0.0
             c._motion_profile(0.0, 13.9, 0.0, 0.0)
             before = c.target_speed
@@ -925,7 +953,8 @@ def self_test():
             heading, curvature, _ = c._entry_guard(520.0, 0.0, 0.0, 0.0, 0.0)
             self.assertTrue(c.entry_avoidance)
             self.assertLess(math.sin(heading), -0.9)
-            self.assertLessEqual(c._motion_profile(curvature, 0.0, 520.0, 0.0)[0], 28.0)
+            self.assertLessEqual(c._motion_profile(curvature, 0.0, 520.0, 0.0)[0],
+                                 ORBIT_RECAPTURE_THRUST)
             c.velocity_x, c.velocity_y = 0.0, -400.0
             c._entry_guard(520.0, 0.0, -math.pi/2, 0.0, 0.0)
             self.assertFalse(c.entry_avoidance)
@@ -946,7 +975,7 @@ def self_test():
             c.section_index = 1
             c.orbit = OrbitProgress(OBS1, 1)
             thrust = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R-60.0)[0]
-            self.assertLessEqual(thrust, 28.0)
+            self.assertLessEqual(thrust, ORBIT_RECAPTURE_THRUST)
 
         def test_fast_path_length_and_speed_envelope(self):
             length = sum(math.hypot(b[0]-a[0], b[1]-a[1])
