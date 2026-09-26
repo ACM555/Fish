@@ -8,7 +8,7 @@
   2) 绕圈方向统一为逆时针（CCW，俯视 XY 平面角度递增）
   3) 障碍2 采用 S 形绕过（先左弯贴南侧、再右弯甩出，不绕圈）
   4) 障碍3 逆时针 2 圈，使用实际位置累计角度，不按路径索引猜圈数
-  5) 保持中层高度、水平姿态，向16秒目标优化（比赛上限60秒）
+  5) 高度锁定为鱼的起点高度（340），全程保持该高度不变，水平姿态
 
 场地坐标（由使用手册 + 历史轨迹 fish_debug_log.csv + 地图数据确认）：
   水池 3000(x) * 2000(y) * 1500(z)，水底中心 (0,0,0)
@@ -38,6 +38,12 @@ v6：① 提速系数 1.08 -> 1.16（用户要求"再快一些"）。
     新版出缝后 52mm 就出现向内趋势，到第三柱西侧已完成 70% 横移，
     且最大曲率 1/222 低于绕圈曲率 1/200（不触发曲率限速、无急拐），
     路径还短了 48mm，entry_guard 也不再触发。
+v7：高度锁定为"鱼的起点高度"（用户要求）。
+    起点 (-1250, 0, 340) 在画面下半部分；旧版把目标高度设成 750（水池中层），
+    开局要先爬升到中层，多花时间、多一次姿态调整。现在 HOLD_Z = START_Z = 340，
+    开赛即处于目标高度：高度误差恒为0，垂直速度目标与俯仰目标恒为0，
+    不会出现"先移动到画面中间"或"再调整回中间高度"的动作。
+    绕障、穿缝、绕圈全程都保持该高度。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -65,13 +71,18 @@ PILLAR_HALF_DIAG = 141.5          # 200x200 柱子的半对角线
 USE_STABLE_PROFILE = '--stable' in sys.argv
 LOOP_R = 210.0 if USE_STABLE_PROFILE else 200.0  # 快档方柱角间隙约59，仍校验>=55
 SAMPLE_STEP = 8.0                 # 路径采样步长
-TARGET_Z = 750.0                  # 1500高水池的中层；起点340，平缓进入中层
+# v7：高度锁定为起点高度，全程不变。
+# 起点 (-1250, 0, 340) 在画面下半部分；旧版以 750（水池中层）为目标高度，
+# 开局要先爬升到中层，既多花时间又多一次姿态调整。现在直接以起点高度为
+# 目标高度，开赛即处于目标高度，不需要任何"过渡到中层"的动作。
+START_Z = 340.0                   # 鱼的起点高度（由官方起点坐标确认）
+HOLD_Z = START_Z                  # 全程保持的高度，与起点高度相同
 WING_NEUTRAL = -90.0             # 胸鳍的UpVector在此角度沿鱼身+x
 MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒推半球
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v6-stable-xy' if USE_STABLE_PROFILE else 'race-v6-immediate-inward'
+PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-start-z'
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -431,17 +442,19 @@ class DepthController:
             self.roll_rate += alpha*(measured-self.roll_rate)
         self.last_pitch, self.last_roll = pitch, roll
 
-        height_error = TARGET_Z-z
-        # 中层附近才积累小幅偏置；远距离爬升和大姿态恢复时禁止积分饱和。
+        height_error = HOLD_Z-z
+        # 贴近锁定高度时才积累小幅偏置；大偏差和大姿态恢复时禁止积分饱和。
         if 12.0 < abs(height_error) < 160.0 and abs(pitch) < 20.0:
             self.integral = _constrain(self.integral+0.04*height_error*dt, -12.0, 12.0)
         else:
             self.integral *= max(0.0, 1.0-dt)
         height_term = 0.0 if abs(height_error) <= 12.0 else height_error
         wanted_vz = _constrain(0.9*height_term+self.integral, -95.0, 95.0)
-        # 起点到中层不突跃：逐步增加垂直速度目标，边前进边到达巡航高度。
+        # 垂直速度目标仍做斜率限制，避免姿态突跃；但开局已处于目标高度，
+        # height_error≈0，因此这里不会产生任何爬升动作。
         self.reference_vz += _constrain(wanted_vz-self.reference_vz, -100.0*dt, 100.0*dt)
         vertical_command = self.reference_vz + 0.7*(self.reference_vz-vertical_speed)
+        # 仍保留靠底/靠顶时的放宽余地，以便姿态异常时能有效恢复。
         pitch_limit = 20.0 if z < 180.0 or z > 1200.0 else 12.0
         self.desired_pitch = _constrain(
             math.degrees(math.atan2(vertical_command, max(220.0, speed))),
@@ -806,7 +819,7 @@ def self_test():
             self.assertEqual(p.angle, 0.0)
 
         def test_limits_and_depth(self):
-            for z in (150.0, 340.0, TARGET_Z, 800.0, 1300.0):
+            for z in (150.0, START_Z, HOLD_Z, 800.0, 1300.0):
                 c = RaceController()
                 command = c.calculate(info(z=z), now=1.0)
                 self.assertLessEqual(abs(command.tail), MAX_TAIL)
@@ -814,9 +827,9 @@ def self_test():
                 self.assertLessEqual(abs(command.right), MAX_THRUST)
                 self.assertLessEqual(abs(command.left_angle-WING_NEUTRAL), MAX_WING_TILT)
                 vertical = DepthController.vertical_component(command.left_angle)
-                if z > TARGET_Z:
+                if z > HOLD_Z:
                     self.assertLess(vertical, 0.0)
-                if z < TARGET_Z:
+                if z < HOLD_Z:
                     self.assertGreater(vertical, 0.0)
 
         def test_finish_is_latched(self):
@@ -1091,15 +1104,42 @@ def self_test():
         def test_level_hold_has_no_upward_thrust(self):
             d = DepthController()
             for _ in range(120):
-                left, right = d.calculate(TARGET_Z, 0.0, 0.0, 0.0, 400.0, 1.0/60.0)
+                left, right = d.calculate(HOLD_Z, 0.0, 0.0, 0.0, 400.0, 1.0/60.0)
                 self.assertAlmostEqual(left, WING_NEUTRAL)
                 self.assertAlmostEqual(right, WING_NEUTRAL)
                 self.assertAlmostEqual(d.desired_pitch, 0.0)
 
+        def test_v7_holds_start_height_all_the_way(self):
+            """用户要求：高度锁定为鱼的起点高度，全程不变，不做中过渡。"""
+            # 目标高度就是起点高度本身，不是水池中层。
+            self.assertEqual(HOLD_Z, START_Z)
+            self.assertEqual(HOLD_Z, 340.0)
+            # 开局即处于目标高度：不应出现任何爬升/下沉意图。
+            d = DepthController()
+            for _ in range(240):
+                left, right = d.calculate(START_Z, 0.0, 0.0, 0.0, 560.0, 1.0/60.0)
+                self.assertAlmostEqual(d.reference_vz, 0.0)
+                self.assertAlmostEqual(d.desired_pitch, 0.0)
+            self.assertAlmostEqual(left, WING_NEUTRAL)
+            self.assertAlmostEqual(right, WING_NEUTRAL)
+            # 沿整条名义路线（含绕圈、穿缝）都保持起点高度，全程无高度变化。
+            c = RaceController()
+            now = 1.0
+            for section in generate_sections():
+                for x, y, heading in section.points:
+                    now += 0.02
+                    command = c.calculate(info(x=x, y=y, z=START_Z, yaw=heading), now=now)
+                    pitch = c.depth.desired_pitch
+                    # 高度误差恒为0，所以垂直指令和俯仰目标都应恒为0。
+                    self.assertAlmostEqual(c.depth.reference_vz, 0.0)
+                    self.assertAlmostEqual(pitch, 0.0)
+                    self.assertLessEqual(abs(command.left_angle-WING_NEUTRAL), MAX_WING_TILT)
+            self.assertEqual(c.reason, 'crossed_finish')
+
         def test_ascent_braking_and_pitch_recovery(self):
             d = DepthController()
             for _ in range(60):
-                left, right = d.calculate(TARGET_Z, 100.0, 20.0, 0.0, 400.0, 1.0/60.0)
+                left, right = d.calculate(HOLD_Z, 100.0, 20.0, 0.0, 400.0, 1.0/60.0)
             self.assertLess(d.desired_pitch, 0.0)
             self.assertLess(d.pitch_trim, 0.0)
             self.assertLess(DepthController.vertical_component(left, pitch=20.0), 0.0)
@@ -1108,7 +1148,7 @@ def self_test():
         def test_roll_correction_uses_angle_not_horizontal_force(self):
             for roll in (-20.0, 20.0):
                 c = RaceController()
-                command = c.calculate(info(z=TARGET_Z, roll=roll), now=1.0)
+                command = c.calculate(info(z=HOLD_Z, roll=roll), now=1.0)
                 self.assertAlmostEqual(command.left, command.right)
                 left_z = DepthController.vertical_component(command.left_angle, roll=roll)
                 right_z = DepthController.vertical_component(command.right_angle, roll=roll)
@@ -1135,7 +1175,7 @@ def self_test():
             c = RaceController()
             c.section_index = len(c.sections)-1
             c.tracker = PathTracker(c.sections[-1].points)
-            c.calculate(info(x=1260.0, z=TARGET_Z), now=1.0)
+            c.calculate(info(x=1260.0, z=HOLD_Z), now=1.0)
             self.assertEqual(c.reason, 'crossed_finish')
 
         def test_invalid_forward_still_stops(self):
@@ -1218,7 +1258,7 @@ def main():
                 print('[race] {:.2f}s stage={} pos={} speed={:.1f}/{:.1f} yaw_error={:.1f} slip={:.1f} z_target={:.0f} vz={:.1f} pitch={:.1f}/{:.1f} wings=({:.1f},{:.1f}) laps={} stage_seconds={}'.format(
                     elapsed, controller.stage, controller.last_position,
                     controller.speed, controller.target_speed, controller.heading_error,
-                    math.degrees(controller.course_slip), TARGET_Z, controller.vertical_speed,
+                    math.degrees(controller.course_slip), HOLD_Z, controller.vertical_speed,
                     controller.pitch_degrees, controller.depth.desired_pitch,
                     command.left_angle, command.right_angle, controller.completed_laps,
                     controller.stage_seconds), flush=True)
@@ -1229,8 +1269,8 @@ def main():
     publisher = mycue.publisher(mycue.FishCtrlInfo)
     subscriber = mycue.subscriber(mycue.FishInfo, lcb)
     waiting_since = time.monotonic()
-    print('[race] {} ready: 1 CCW lap -> S passage -> 2 CCW laps -> finish; z_target={} wing_neutral={}'.format(
-        PROFILE_NAME, TARGET_Z, WING_NEUTRAL), flush=True)
+    print('[race] {} ready: 1 CCW lap -> S passage -> 2 CCW laps -> finish; hold_z={} wing_neutral={}'.format(
+        PROFILE_NAME, HOLD_Z, WING_NEUTRAL), flush=True)
     try:
         while not controller.finished:
             time.sleep(0.05)
