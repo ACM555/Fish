@@ -44,6 +44,16 @@ v7：高度锁定为"鱼的起点高度"（用户要求）。
     开赛即处于目标高度：高度误差恒为0，垂直速度目标与俯仰目标恒为0，
     不会出现"先移动到画面中间"或"再调整回中间高度"的动作。
     绕障、穿缝、绕圈全程都保持该高度。
+v7.1：修复"绕第三个障碍物转圈时高度持续增加"（用户反馈）。
+    根因不是目标高度，而是高度环**守不住持续低头偏置**：
+      ① 积分只在 12~160mm 误差区间累积，误差一回到死区就把偏置泄放掉；
+      ② 积分上限仅 ±12（换算低头约 4 度）；
+      ③ 积分速率 0.04 建立偏置要约 28 秒，而绕第三柱 2 圈只有约 4 秒，
+         偏置还没建起来绕圈就结束了 —— 这是高度一路爬升的直接原因。
+    修法：死区内**保持**偏置（只按小系数泄放）、积分上限放宽到 ±30、
+    积分速率提到 0.25（约 4 秒满偏置，能在一次绕圈内抵消持续扰动）、
+    常规俯仰上限 12->18 度，并按 cos(roll) 补偿绕圈横滚造成的翼面竖直效率衰减。
+    平飞回归：在目标高度上 ref_vz / pitch / integral 仍恒为 0，不产生多余动作。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -77,6 +87,17 @@ SAMPLE_STEP = 8.0                 # 路径采样步长
 # 目标高度，开赛即处于目标高度，不需要任何"过渡到中层"的动作。
 START_Z = 340.0                   # 鱼的起点高度（由官方起点坐标确认）
 HOLD_Z = START_Z                  # 全程保持的高度，与起点高度相同
+# 高度保持环参数（v7.1）。绕第三柱连续 2 圈时高度持续爬升，原因是持续扰动
+# 需要一个"持续低头偏置"来抵消，而原实现无法维持这个偏置（详见 DepthController）。
+Z_DEADBAND = 6.0                  # 高度死区：此范围内保持偏置，不做纠偏激励
+KP_HEIGHT = 0.9                   # 高度误差 -> 垂直速度目标 的比例
+# 误差积分速率。原值 0.04 建立偏置约需 28 秒，而绕第三柱 2 圈只有约 4 秒，
+# 偏置还没建起来绕圈就结束了 —— 这是高度一路爬升的直接原因。0.25 约 4 秒
+# 满偏置，能在一次绕圈内把持续扰动抵消掉。
+KI_HEIGHT = 0.25
+INTEGRAL_LIMIT = 30.0             # 积分权限（原 ±12 换算成低头仅约 4 度，不够）
+INTEGRAL_LEAK = 1.0               # 到位后偏置泄放速率；过大残留偏置会导致反向超调
+PITCH_LIMIT_NORMAL = 18.0         # 常规俯仰上限（原 12 度换算垂直速度约 124mm/s，太紧）
 WING_NEUTRAL = -90.0             # 胸鳍的UpVector在此角度沿鱼身+x
 MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒推半球
 MAX_THRUST = 50.0
@@ -443,27 +464,45 @@ class DepthController:
         self.last_pitch, self.last_roll = pitch, roll
 
         height_error = HOLD_Z-z
-        # 贴近锁定高度时才积累小幅偏置；大偏差和大姿态恢复时禁止积分饱和。
-        if 12.0 < abs(height_error) < 160.0 and abs(pitch) < 20.0:
-            self.integral = _constrain(self.integral+0.04*height_error*dt, -12.0, 12.0)
+        # v7.1：绕第三柱连续 2 圈时高度持续爬升。原因是"持续扰动需要持续低头偏置
+        # 来抵消"，而旧实现守不住这个偏置：①只在 12~160mm 误差区间积分，误差一
+        # 回到死区内就把偏置泄放掉，于是偏置刚建立就被抹掉；②积分上限只有 ±12，
+        # 换算成低头只有约 4 度，权限不足以压住持续上浮。
+        # 现在：死区内**保持**偏置（只做很慢的泄放），并放宽积分权限。
+        if abs(height_error) < Z_DEADBAND:
+            # 已在目标高度附近：保留已建立的偏置，仅按 INTEGRAL_LEAK 缓慢泄放，
+            # 这样持续扰动期间偏置守得住，扰动消失后也能自然退回零配平。
+            self.integral *= max(0.0, 1.0 - INTEGRAL_LEAK*dt)
+        elif abs(height_error) < 160.0 and abs(pitch) < 20.0:
+            self.integral = _constrain(
+                self.integral+KI_HEIGHT*height_error*dt,
+                -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
         else:
-            self.integral *= max(0.0, 1.0-dt)
-        height_term = 0.0 if abs(height_error) <= 12.0 else height_error
-        wanted_vz = _constrain(0.9*height_term+self.integral, -95.0, 95.0)
+            # 大偏差或大姿态：停止继续积分，但不立即清零，避免偏置反复重建。
+            self.integral *= max(0.0, 1.0-0.5*dt)
+        height_term = 0.0 if abs(height_error) <= Z_DEADBAND else height_error
+        wanted_vz = _constrain(KP_HEIGHT*height_term+self.integral, -95.0, 95.0)
         # 垂直速度目标仍做斜率限制，避免姿态突跃；但开局已处于目标高度，
         # height_error≈0，因此这里不会产生任何爬升动作。
-        self.reference_vz += _constrain(wanted_vz-self.reference_vz, -100.0*dt, 100.0*dt)
+        self.reference_vz += _constrain(wanted_vz-self.reference_vz, -140.0*dt, 140.0*dt)
         vertical_command = self.reference_vz + 0.7*(self.reference_vz-vertical_speed)
-        # 仍保留靠底/靠顶时的放宽余地，以便姿态异常时能有效恢复。
-        pitch_limit = 20.0 if z < 180.0 or z > 1200.0 else 12.0
+        # 靠底/靠顶时放宽，便于姿态异常时恢复；常规高度上给足 18 度权限。
+        pitch_limit = 20.0 if z < 180.0 or z > 1200.0 else PITCH_LIMIT_NORMAL
         self.desired_pitch = _constrain(
             math.degrees(math.atan2(vertical_command, max(220.0, speed))),
             -pitch_limit, pitch_limit)
 
         recovering = abs(pitch) > 30.0 or abs(roll) > 40.0
         trim_limit = 65.0 if recovering else 35.0
+        # 横滚会让翼面竖直效率按 cos(roll) 衰减（绕圈时鱼体持续横滚），
+        # 若不补偿，同样的俯仰修正只能换回一部分竖直力，高度就压不住。
+        # 按 cos(roll) 放宽上限做补偿，最多放大 1.67 倍，并收口在物理倾角内。
+        authority = max(math.cos(math.radians(roll)), 0.6)
         pitch_trim = _constrain(
-            2.0*(self.desired_pitch-pitch)-0.9*self.pitch_rate, -trim_limit, trim_limit)
+            2.0*(self.desired_pitch-pitch)-0.9*self.pitch_rate,
+            -trim_limit/authority, trim_limit/authority)
+        pitch_trim = _constrain(pitch_trim,
+                                -MAX_WING_TILT+5.0, MAX_WING_TILT-5.0)
         # UE正Roll时右侧下沉，需要右胸鳍多给上分力，而非增加右侧前向推力。
         roll_trim = _constrain(0.65*roll+0.25*self.roll_rate,
                                -18.0 if recovering else -12.0,
@@ -840,6 +879,46 @@ def self_test():
             self.assertEqual(c.reason, 'crossed_finish')
             command = c.calculate(info(x=1200.0), now=2.0)
             self.assertEqual((command.tail, command.left, command.right), (0.0, 0.0, 0.0))
+
+        def test_v7_1_holds_height_during_sustained_orbit_climb(self):
+            """用户反馈：绕第三个障碍物转圈时高度持续增加，需要压住。"""
+            # 用最小闭环复现"绕圈时被持续上浮"：俯仰一阶跟随，竖直速度由俯仰产生
+            # 并叠加一个持续上浮扰动（绕圈时鱼体横滚、翼面竖直效率下降也会等效成它）。
+            def closed_loop(roll, disturb_vz, steps=420, speed=583.0):
+                d = DepthController()
+                z, vz, pitch, dt = HOLD_Z, 0.0, 0.0, 1.0/60.0
+                peak = 0.0
+                for _ in range(steps):
+                    d.calculate(z, vz, pitch, roll, speed, dt)
+                    efficiency = max(math.cos(math.radians(roll)), 0.0)
+                    pitch += (d.desired_pitch-pitch)*(dt/(0.35+dt))
+                    vz = speed*math.tan(math.radians(pitch))*efficiency + disturb_vz
+                    z += vz*dt
+                    peak = max(peak, z-HOLD_Z)
+                return z-HOLD_Z, peak
+
+            # 绕圈时鱼体横滚 35 度，持续上浮 60mm/s（约 4 秒 = 绕 2 圈的量级）。
+            residual, peak = closed_loop(roll=35.0, disturb_vz=60.0)
+            # 关键：不允许持续发散。峰值有界，稳态不再继续累积。
+            self.assertLess(peak, 60.0)
+            self.assertLess(residual, 40.0)
+            # 同样扰动下，竖直增益足够把偏置建立起来（积分达到可用量级）。
+            d = DepthController()
+            for _ in range(240):
+                d.calculate(HOLD_Z-30.0, 30.0, 0.0, 0.0, 583.0, 1.0/60.0)
+            self.assertGreater(abs(d.integral), 12.0)
+            # 扰动消失后必须能回到目标高度，不留稳态偏差。
+            d = DepthController()
+            z, vz, pitch = HOLD_Z, 0.0, 0.0
+            dt = 1.0/60.0
+            for i in range(900):
+                disturb = 60.0 if i < 240 else 0.0
+                d.calculate(z, vz, pitch, 35.0, 583.0, dt)
+                efficiency = max(math.cos(math.radians(35.0)), 0.0)
+                pitch += (d.desired_pitch-pitch)*(dt/(0.35+dt))
+                vz = 583.0*math.tan(math.radians(pitch))*efficiency + disturb
+                z += vz*dt
+            self.assertLess(abs(z-HOLD_Z), 25.0)
 
         def test_bad_data_and_timeout(self):
             c = RaceController()
