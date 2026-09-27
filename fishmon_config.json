@@ -1,0 +1,60 @@
+{
+  "watch_paths": [
+    "test.py",
+    "WindowsNoEditor/Scripts/test.py",
+    "WindowsNoEditor/Scripts/project1/test.py",
+    "WindowsNoEditor/Scripts/project1/main.py"
+  ],
+  "watch_dirs": [
+    "WindowsNoEditor/Scripts/project1",
+    "WindowsNoEditor/Scripts"
+  ],
+  "process_name_patterns": [
+    "fish"
+  ],
+  "process_cmdline_patterns": [
+    "test.py"
+  ],
+  "sample_interval_sec": 1.0,
+  "thread_sample_every": 5,
+  "gpu_sample_every": 3,
+  "keep_top_threads": 12,
+  "auto_start_on_watch": true,
+  "trial_idle_timeout_sec": 45.0,
+  "max_trial_sec": 900.0,
+  "output_dir": "monitor_reports",
+  "report_top_n": 8,
+  "process_cmdline_hosts": [
+    "python.exe",
+    "pythonw.exe",
+    "python3.exe",
+    "py.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe"
+  ],
+  "process_discover_every": 10,
+  "process_rescan_gap_sec": 3.0,
+  "thread_fallback_refresh_sec": 30.0,
+  "restart_trial_on_update": true,
+  "log_paths": [
+    "WindowsNoEditor/Fish427/Binaries/Win64/fish_race.log"
+  ],
+  "log_dirs": [],
+  "log_tail_max_bytes": 262144,
+  "log_keep_lines": 4000,
+  "orbit_centers": {
+    "orbit_1": [
+      -750.0,
+      0.0
+    ],
+    "orbit_3": [
+      750.0,
+      0.0
+    ]
+  },
+  "orbit_recapture_threshold_mm": 40.0,
+  "orbit_recapture_thrust": 39.2,
+  "loop_r_mm": 200.0,
+  "max_thrust": 50.0
+}

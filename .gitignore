@@ -12,3 +12,6 @@ Thumbs.db
 
 # 每次运行覆盖写的遥测，属于运行时产物，不入库
 race_telemetry.csv
+
+# fishmon 监控工具的产物（报告与逐帧 CSV），属于运行时产物
+monitor_reports/
