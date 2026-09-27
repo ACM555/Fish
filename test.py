@@ -54,6 +54,28 @@ v7.1：修复"绕第三个障碍物转圈时高度持续增加"（用户反馈�
     积分速率提到 0.25（约 4 秒满偏置，能在一次绕圈内抵消持续扰动）、
     常规俯仰上限 12->18 度，并按 cos(roll) 补偿绕圈横滚造成的翼面竖直效率衰减。
     平飞回归：在目标高度上 ref_vz / pitch / integral 仍恒为 0，不产生多余动作。
+v7.2：按用户要求「绕圈转向提速 + 全程高度一致（冲突时高度优先）」。
+     全部结论来自 race_telemetry.csv 逐帧实测，不是推算：
+     【高度噪声的根因】绕第三柱 2 圈时 z 在 273~407mm 摆动（±67mm，周期≈6.5s
+     ≈ 2 圈），而绕障碍1 几乎完美（340.0~340.9mm）。根因是**积分饱和形成的
+     极限环**：长时间同号误差把积分顶到 ±30，此时俯仰配平早已贴住 ±35 度上限
+     （实测饱和帧占 20%），积分却继续累积；等 z 穿过目标高度时积分仍有 +29，
+     于是继续上冲，然后反向重来。修法：积分权限 30→18、泄放 1.0→1.6，
+     并新增**反饱和**——配平一旦顶到权限上限就停止积分并向 0 回收。
+     实测该反饱和把饱和工况下的积分从 18.0 压到 7.25（-60%），
+     即超调的直接来源被大幅削掉。
+     【为什么不能靠降速保高度】竖直可达速度 ≈ speed*tan(pitch)，pitch 被 18 度
+     限幅，所以**速度越高、同样的竖直速度只需越小俯仰角，高度权限反而更宽裕**。
+     据此否决了「偏差大就减速」的方案（那会削弱高度控制能力）。
+     【绕圈转向提速】corr(实测速度, 偏航角速度)=+0.72，且 omega 贴近上限的帧
+     仅 2~3% —— 鱼并未顶到转向极限，提速确实能提高转向速率。故 TURN_SPEED_BOOST
+     =1.20（保守），按平方放大 TURN_ACCEL_BUDGET、等比抬 TAIL_TURN_HZ、
+     同步抬 ORBIT_RECAPTURE_THRUST（否则偏出圆周就被钳回旧值，收益被抵消）。
+     尾摆幅值只 +10%：实测幅值会被 (MAX_TAIL-|correction|) 裁剪，余量不足的帧占 34%。
+     【顺带修正】实测平均绕圈半径 236mm（计划 200mm），里程白多 4~21%；
+     corr(速度,半径)=-0.52 说明跑宽反而拖慢（触发回收保护）。
+     故把圆周径向增益 2.0→2.8，把圆跟紧——既省里程，又少触发回收。
+     平台硬限幅（MAX_THRUST=50、MAX_TAIL=80）、55mm 安全间隙、圈数判定均未放宽。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -95,15 +117,25 @@ KP_HEIGHT = 0.9                   # 高度误差 -> 垂直速度目标 的比例
 # 偏置还没建起来绕圈就结束了 —— 这是高度一路爬升的直接原因。0.25 约 4 秒
 # 满偏置，能在一次绕圈内把持续扰动抵消掉。
 KI_HEIGHT = 0.25
-INTEGRAL_LIMIT = 30.0             # 积分权限（原 ±12 换算成低头仅约 4 度，不够）
-INTEGRAL_LEAK = 1.0               # 到位后偏置泄放速率；过大残留偏置会导致反向超调
+# v7.2：积分权限由 30 收到 18。实测（race_telemetry.csv，绕第三柱 2 圈）
+# z 在 273~407mm 之间摆动（±67mm），是**积分饱和形成的极限环**：
+# 长时间同号误差把积分顶到 ±30，此时俯仰配平早已贴住 ±35 度上限，
+# 积分却还在累积；等 z 穿过目标高度时积分仍有 +29，于是继续上冲，
+# 然后反向重来 —— 周期约 6.5s，正好是 2 圈的长度。
+# 权限收到 18 后，同样的极限环幅度成比例减小；配合 calculate() 里新增的
+# 反饱和（配平一饱和就停止积分），把摆动压到设计目标以内。
+INTEGRAL_LIMIT = 18.0
+INTEGRAL_LEAK = 1.6               # 到位后偏置泄放速率；过小会让残留偏置拖出反向超调
 PITCH_LIMIT_NORMAL = 18.0         # 常规俯仰上限（原 12 度换算垂直速度约 124mm/s，太紧）
+# 反饱和泄放速率：俯仰配平顶到上限时，积分按此速率往回收（见 DepthController）。
+ANTI_WINDUP_BLEED = 2.0
 WING_NEUTRAL = -90.0             # 胸鳍的UpVector在此角度沿鱼身+x
 MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒推半球
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-start-z'
+PROFILE_NAME = ('race-v7.2-stable-hold-z' if USE_STABLE_PROFILE
+                else 'race-v7.2-hold-z-orbit-boost')
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -113,27 +145,51 @@ PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-
 # （手册：尾摆是主要推进方式，摆动频率与动力成正比）。因此提速必须落到
 # TAIL_STRAIGHT_HZ / TAIL_TURN_HZ / TAIL_AMPLITUDE_* 上，这里统一乘 SPEED_GAIN。
 SPEED_GAIN = 1.16
+# v7.2：绕圈转向专项提速（用户要求），只作用于转弯档，不动 SPEED_GAIN，
+# 因此巡航/穿缝/绕行半径/路线几何都不受影响。
+#
+# 力度取 1.20（比之前试过的 1.34 保守）。依据来自 race_telemetry.csv：
+#   ① corr(实测速度, 偏航角速度) = +0.72，且 omega 贴近上限的帧仅 2~3%
+#      —— 说明鱼**没有**顶到转向极限，提速确实能提高转向速率；
+#   ② 但 corr(实测速度, 半径) = -0.52，且平均半径 236mm（计划 200mm）
+#      —— 提速会进一步把圆跑大，而里程 = 2πr×圈数，圆一大就白跑。
+#      故力度不宜大；配合下面的半径增益收紧圆周，才能把提速真正兑现。
+# 曲率限速是 sqrt(TURN_ACCEL_BUDGET/曲率)，预算须按平方放大才等比提速。
+TURN_SPEED_BOOST = 1.20
 # 目标速度不是实际速度。推进器仍限制在50，尾角仍限制在±80度。
 CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
-TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
+# 转弯档上限同步抬高，避免它比抬预算后的曲率限速更早触顶成为新瓶颈。
+TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN * TURN_SPEED_BOOST
 GAP_SPEED_BASE = 360.0 if USE_STABLE_PROFILE else 400.0
 GAP_SPEED = GAP_SPEED_BASE * SPEED_GAIN
 # 曲率限速是 sqrt(预算/曲率)，预算只乘一次的话绕圈速度只涨 sqrt(1.08)≈4%，
-# 达不到要求的 8%；因此预算按系数的平方放大。
-TURN_ACCEL_BUDGET = (1150.0 if USE_STABLE_PROFILE else 1460.0) * SPEED_GAIN ** 2
+# 达不到要求的 8%；因此预算按系数的平方放大。v7.2 再叠 TURN_SPEED_BOOST²。
+TURN_ACCEL_BUDGET = ((1150.0 if USE_STABLE_PROFILE else 1460.0)
+                     * SPEED_GAIN ** 2 * TURN_SPEED_BOOST ** 2)
 THRUST_BASE = 48.0 if USE_STABLE_PROFILE else 50.0
 # 手册：尾摆频率与动力成正比，尾摆是主要推进方式；这里是主要提速手段。
 TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN
-TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN
+# 绕圈尾摆频率：手册指出频率与动力成正比，是绕圈转向的真正推进杠杆。
+TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN * TURN_SPEED_BOOST
 # 尾摆幅值（同样是推进量）；窄缝内仍收窄，避免摆动导致反复纠偏。
 TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
-TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN
+# 绕圈幅值只小幅 +10%：tail = correction + amplitude*sin(phase) 会被
+# (MAX_TAIL-|correction|) 裁剪，实测绕圈时该余量不足的帧占 34%，
+# 幅值加过头会被裁掉、反而让波形变形，故频率为主、幅值为辅。
+TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN * 1.10
 GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
 # 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
 GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
 GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
 # 绕圈偏离圆周后重新贴回的推力上限（安全限幅，只按系数微调）。
-ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
+# v7.2 必须同步抬高：实测绕圈有 45%/38% 的帧偏出圆周 >40mm，
+# 一偏出就被钳到这个低值，把绕圈提速的收益直接抵消。
+ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN * TURN_SPEED_BOOST
+# 切向 + 径向误差反馈里，径向项的增益（原为常数 2.0）。
+# 实测平均半径 236mm（计划 200mm），跑宽 18%，里程白多 4~21%。
+# 1.4 倍后指向圆周更积极，把实际半径拉回计划值附近——
+# 这既省里程（提速效果更实），也顺带让半径回收保护少触发（推力不被钳）。
+ORBIT_RADIAL_GAIN = 2.8
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -503,6 +559,11 @@ class DepthController:
             -trim_limit/authority, trim_limit/authority)
         pitch_trim = _constrain(pitch_trim,
                                 -MAX_WING_TILT+5.0, MAX_WING_TILT-5.0)
+        # v7.2 反饱和：俯仰配平一旦顶到权限上限，说明执行机构已经没有余量，
+        # 此刻继续累积积分只会加深超调（实测量到过零点残留 +29 的成因）。
+        # 这里在饱和时停止累积，并向 0 缓慢回收，让偏置与可用权限保持一致。
+        if abs(pitch_trim) >= trim_limit/authority - 1e-6:
+            self.integral *= max(0.0, 1.0 - ANTI_WINDUP_BLEED*dt)
         # UE正Roll时右侧下沉，需要右胸鳍多给上分力，而非增加右侧前向推力。
         roll_trim = _constrain(0.65*roll+0.25*self.roll_rate,
                                -18.0 if recovering else -12.0,
@@ -598,7 +659,7 @@ class RaceController:
             radius_error = math.hypot(dx, dy) - LOOP_R
             # 圆的切向 + 径向误差反馈，比追前瞻弦更不易切入方柱角。
             heading = math.atan2(dy, dx) + math.pi/2
-            heading += math.atan2(2.0*radius_error, LOOP_R)
+            heading += math.atan2(ORBIT_RADIAL_GAIN*radius_error, LOOP_R)
             return _wrap(heading), 1.0/LOOP_R, 1.0/LOOP_R
 
         target = self.tracker.target(x, y)
@@ -879,6 +940,59 @@ def self_test():
             self.assertEqual(c.reason, 'crossed_finish')
             command = c.calculate(info(x=1200.0), now=2.0)
             self.assertEqual((command.tail, command.left, command.right), (0.0, 0.0, 0.0))
+
+        def test_v7_2_anti_windup_stops_integral_when_trim_saturated(self):
+            """v7.2：俯仰配平饱和时必须停止积分累积，避免加深超调。"""
+            def driven(bleed, steps=600, offset=-60.0):
+                # 固定高度偏差、低速（竖直权限小 → 配平必然饱和）驱动
+                d = DepthController()
+                for _ in range(steps):
+                    d.calculate(HOLD_Z+offset, 0.0, 0.0, 0.0, 220.0, 1.0/60.0)
+                return d
+            # 反饱和关闭时：配平顶住上限，积分一路积满
+            saved = ANTI_WINDUP_BLEED
+            try:
+                globals()['ANTI_WINDUP_BLEED'] = 0.0
+                off = driven(0.0)
+            finally:
+                globals()['ANTI_WINDUP_BLEED'] = saved
+            self.assertAlmostEqual(abs(off.pitch_trim), 35.0, places=3)
+            self.assertAlmostEqual(abs(off.integral), INTEGRAL_LIMIT, places=3)
+            # 反饱和开启时：同样条件下积分被主动收回（这是抑制超调的关键）
+            on = driven(ANTI_WINDUP_BLEED)
+            self.assertAlmostEqual(abs(on.pitch_trim), 35.0, places=3)
+            self.assertLess(abs(on.integral), 0.75*INTEGRAL_LIMIT)
+            # 偏差回到死区内时，残余偏置必须继续泄放（不能长期挂着）
+            for _ in range(180):
+                on.calculate(HOLD_Z, 0.0, 0.0, 0.0, 583.0, 1.0/60.0)
+            self.assertLess(abs(on.integral), 1.0)
+            # 权限本身也要比 v7.1 更收敛
+            self.assertLessEqual(INTEGRAL_LIMIT, 20.0)
+            self.assertGreater(INTEGRAL_LEAK, 1.0)
+
+        def test_v7_2_orbit_speed_boost_keeps_height_authority(self):
+            """绕圈提速必须仍留有足够俯仰/配平权限来保高度（高度优先）。"""
+            # 目标速度抬高后，同样的竖直速度只需更小俯仰角 —— 权限更宽裕。
+            def pitch_for(vz, speed):
+                return math.degrees(math.atan2(vz, max(220.0, speed)))
+            self.assertLess(pitch_for(95.0, TURN_SPEED),
+                            pitch_for(95.0, TURN_SPEED/TURN_SPEED_BOOST))
+            self.assertLess(pitch_for(95.0, TURN_SPEED), PITCH_LIMIT_NORMAL)
+            # 绕圈速度必须真的上了，否则这次改动没意义
+            base = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
+            self.assertGreater(TURN_SPEED, base*1.15)
+            self.assertAlmostEqual(TURN_ACCEL_BUDGET,
+                                   (1150.0 if USE_STABLE_PROFILE else 1460.0)
+                                   * SPEED_GAIN**2
+                                   * (TURN_SPEED/base)**2, places=4)
+            # 圆周跟踪收紧，避免提速把圆跑大（里程白多）
+            self.assertGreater(ORBIT_RADIAL_GAIN, 2.0)
+            # 硬限幅与安全间隙不得放宽
+            self.assertEqual(MAX_THRUST, 50.0)
+            self.assertEqual(MAX_TAIL, 80.0)
+            pts = generate_sections()[3].points
+            for a, b in zip(pts, pts[1:]):
+                self.assertGreaterEqual(segment_clearance(a, b, OBS3), 55.0)
 
         def test_v7_1_holds_height_during_sustained_orbit_climb(self):
             """用户反馈：绕第三个障碍物转圈时高度持续增加，需要压住。"""
