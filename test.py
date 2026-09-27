@@ -54,17 +54,6 @@ v7.1：修复"绕第三个障碍物转圈时高度持续增加"（用户反馈�
     积分速率提到 0.25（约 4 秒满偏置，能在一次绕圈内抵消持续扰动）、
     常规俯仰上限 12->18 度，并按 cos(roll) 补偿绕圈横滚造成的翼面竖直效率衰减。
     平飞回归：在目标高度上 ref_vz / pitch / integral 仍恒为 0，不产生多余动作。
-v7.2：按用户要求做两件事。
-     ① 确认高度统一在鱼的起点高度：目标高度仍是 HOLD_Z = START_Z = 340，
-        v7/v7.1 已实现，本次未再改动高度逻辑，仅作回归确认。
-     ② 只提速「每次绕圈转向」（不动巡航与穿缝）：新增 TURN_SPEED_BOOST = 1.34，
-        按平方放大 TURN_ACCEL_BUDGET（曲率限速是 sqrt(预算)，平方放大才能
-        等比提速）、等比抬高 TAIL_TURN_HZ（尾摆频率与动力成正比，是真正的
-        推进杠杆），并同步抬高 ORBIT_RECAPTURE_THRUST，避免绕圈一偏出圆周
-        就被钳回旧的低推力而抵消收益。TAIL_AMPLITUDE_TURN 只 +15%，因为
-        tail 会被 (MAX_TAIL-|correction|) 裁剪，幅值加过头会变形。
-        效果（快档）：绕圈目标速度 626->839mm/s、尾摆 4.18->5.60Hz、
-        回收推力 32.5->43.5，平台硬限幅与 55mm 安全间隙均未放宽。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -114,7 +103,7 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v7.2-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7.2-hold-z-orbit-boost'
+PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-start-z'
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -124,53 +113,27 @@ PROFILE_NAME = 'race-v7.2-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7.2-h
 # （手册：尾摆是主要推进方式，摆动频率与动力成正比）。因此提速必须落到
 # TAIL_STRAIGHT_HZ / TAIL_TURN_HZ / TAIL_AMPLITUDE_* 上，这里统一乘 SPEED_GAIN。
 SPEED_GAIN = 1.16
-# v7.2：只针对「绕圈转向」再提速（用户要求：提升每次绕圈转向的速度）。
-#
-# 绕圈时的目标速度由曲率限速 sqrt(TURN_ACCEL_BUDGET/曲率) 给出，
-# 在快档 LOOP_R=200 处等于 626.8，**它是真正的约束**（TURN_SPEED 上限 626.4
-# 两者几乎同时触顶，所以只抬 cap 无效，必须同时抬预算）。因此这里单独抬「转弯档」，
-# 不动整体 SPEED_GAIN —— 巡航、穿缝、绕行半径都不受影响：
-#   ① TURN_ACCEL_BUDGET ×BOOST²：曲率限速是 sqrt(预算)，预算按平方放大，
-#      绕圈目标速度才真正到 BOOST 倍（这是绕圈转向提速的主杠杆）；
-#   ② TAIL_TURN_HZ ×BOOST：手册说尾摆频率与动力成正比，绕圈时 turning=True
-#      用的正是这一组频率，是真正的推进手段；
-#   ③ TAIL_AMPLITUDE_TURN 只小幅 +15%（见下方注释，加大会被 MAX_TAIL 裁掉）；
-#   ④ ORBIT_RECAPTURE_THRUST ×BOOST：否则一偏出圆周就被钳到旧的低值，
-#      把上面三条的收益直接抵消（这正是绕圈跑不快的实测原因）。
-# 平台硬限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙 55、圈数判定均不放宽。
-# 注：弯道前馈 feedforward = 0.15*degrees(speed*曲率) 会随绕圈速度抬高**自动**
-# 变大（626->839 使前馈由 26.9° 升到 30° 的饱和上限），所以无需改这个系数。
-TURN_SPEED_BOOST = 1.34
 # 目标速度不是实际速度。推进器仍限制在50，尾角仍限制在±80度。
 CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
-# 转弯档上限也跟着抬（避免它比抬预算后的曲率限速更早触顶，成了新瓶颈）。
-TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN * TURN_SPEED_BOOST
+TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
 GAP_SPEED_BASE = 360.0 if USE_STABLE_PROFILE else 400.0
 GAP_SPEED = GAP_SPEED_BASE * SPEED_GAIN
 # 曲率限速是 sqrt(预算/曲率)，预算只乘一次的话绕圈速度只涨 sqrt(1.08)≈4%，
 # 达不到要求的 8%；因此预算按系数的平方放大。
-# v7.2：再叠一个 TURN_SPEED_BOOST²，专门把绕圈转向的目标速度抬上去。
-TURN_ACCEL_BUDGET = (1150.0 if USE_STABLE_PROFILE else 1460.0) * SPEED_GAIN ** 2 * TURN_SPEED_BOOST ** 2
+TURN_ACCEL_BUDGET = (1150.0 if USE_STABLE_PROFILE else 1460.0) * SPEED_GAIN ** 2
 THRUST_BASE = 48.0 if USE_STABLE_PROFILE else 50.0
 # 手册：尾摆频率与动力成正比，尾摆是主要推进方式；这里是主要提速手段。
 TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN
-# 绕圈时的尾摆频率——绕圈转向提速的主要推进手段（见 TURN_SPEED_BOOST 注释）。
-TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN * TURN_SPEED_BOOST
+TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN
 # 尾摆幅值（同样是推进量）；窄缝内仍收窄，避免摆动导致反复纠偏。
 TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
-# 绕圈幅值：只小幅 +15%。原因：tail = correction + amplitude*sin(phase)，
-# calculate() 会按 (MAX_TAIL-|correction|) 裁剪，而绕圈时 |correction| 可达
-# 62°（前馈在提速后顶到 30°，再加上 PID），只剩约 18° 余量。
-# 若把幅值也乘 1.34 到 28°，会被裁剪、反而让波形变形。故频率才是主杠杆。
-TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN * 1.15
+TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN
 GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
 # 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
 GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
 GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
 # 绕圈偏离圆周后重新贴回的推力上限（安全限幅，只按系数微调）。
-# 必须跟 TURN_SPEED_BOOST 一起抬：否则绕圈一偏出圆周就被钳回旧值，
-# 抬高转弯速度/尾摆的收益会被这条保护直接抵消。
-ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN * TURN_SPEED_BOOST
+ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -1012,40 +975,6 @@ def self_test():
             after = c._motion_profile(0.0, 40.1, -1100.0, 0.0)[0]
             self.assertLess(abs(before-after), 0.2)
             self.assertLessEqual(c._motion_profile(0.0, 140.0, -1100.0, 0.0)[0], 10.0)
-
-        def test_v7_2_orbit_turning_speed_boost(self):
-            """用户要求：提升每次绕圈转向的速度（模块级专项提速）。"""
-            base_cap = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
-            # 绕圈目标速度上限必须高于「只乘 SPEED_GAIN」的那一档。
-            self.assertGreater(TURN_SPEED, base_cap)
-            boost = TURN_SPEED / base_cap
-            self.assertGreaterEqual(boost, 1.25)
-            # 曲率限速是 sqrt(预算/曲率)：预算按 boost^2 放大，
-            # 在绕行半径处才真正给出 boost 倍的目标速度。
-            self.assertAlmostEqual(
-                TURN_ACCEL_BUDGET, (1150.0 if USE_STABLE_PROFILE else 1460.0)
-                * SPEED_GAIN ** 2 * boost ** 2, places=6)
-            c = RaceController()
-            c.speed = 500.0
-            c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], OBS1[1]-LOOP_R)
-            self.assertGreaterEqual(c.target_speed, base_cap * 1.25)
-            self.assertLessEqual(c.target_speed, TURN_SPEED)
-            # 绕圈尾摆频率同步抬升 —— 手册：尾摆频率与动力成正比，是真正的推进杠杆。
-            self.assertAlmostEqual(
-                TAIL_TURN_HZ,
-                (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN * boost, places=6)
-            # 回收保护必须同步抬，否则绕圈一偏出圆周就被钳回旧值、收益被抵消。
-            self.assertGreater(ORBIT_RECAPTURE_THRUST, 28.0 * SPEED_GAIN)
-            self.assertLessEqual(ORBIT_RECAPTURE_THRUST, MAX_THRUST)
-            # 幅值会被 (MAX_TAIL-|correction|) 裁剪，故只要求不低于旧值，
-            # 保证裁剪后的有效幅值不会比提速前更小。
-            self.assertGreaterEqual(TAIL_AMPLITUDE_TURN, 18.0 * SPEED_GAIN)
-            # 平台硬限幅与安全间隙不得放宽。
-            self.assertEqual(MAX_THRUST, 50.0)
-            self.assertEqual(MAX_TAIL, 80.0)
-            for a, b in zip(generate_sections()[3].points,
-                            generate_sections()[3].points[1:]):
-                self.assertGreaterEqual(segment_clearance(a, b, OBS3), 55.0)
 
         def test_gap_fast_only_when_aligned(self):
             c = RaceController()
