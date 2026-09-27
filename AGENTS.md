@@ -216,6 +216,23 @@ FishCtrlInfo:  wing_target_angel_left, wing_target_angel_right,
 `文件名,成绩,日期,时间`（超时或违规记「无效成绩」）。**该文件由裁判/平台写入，
 策略代码不得改写它**。
 
+### 6.1 自动遥测：`race_telemetry.csv`（v7.2 起）
+
+**不需要手动导出或转发任何日志。** `test.py` 每次运行结束时自动在**本文件同目录**
+写出 `race_telemetry.csv`（覆盖写），逐帧记录：
+
+```
+Time(s),Stage,PosX,PosY,PosZ,Pitch,Roll,Speed,TargetSpeed,
+VerticalSpeed,YawError,RefVz,DesiredPitch,DepthIntegral,PitchTrim,
+Tail,ThrustL,ThrustR,WingLeft,WingRight
+```
+
+跑完终端会打印一行 `[race] telemetry -> .../race_telemetry.csv (N frames)`。
+这份 CSV 和 AI 的工作目录是同一个，**跑一次即可直接分析**，无需粘贴或上传。
+
+> 旧的 `fish_debug_log.csv` 是早期版本/平台写出的，2026-09-22 后未再更新；
+> 新的诊断一律以 `race_telemetry.csv` 为准。
+
 ---
 
 ## 7. 代码结构与关键常量
@@ -244,7 +261,7 @@ FishCtrlInfo:  wing_target_angel_left, wing_target_angel_right,
 | `MAX_TAIL` | 80.0 | 尾舵限幅（平台硬限制，不可放宽） |
 | `WING_NEUTRAL` | -90.0 | 胸鳍「沿鱼身向前」的基准角 |
 | `MAX_WING_TILT` | 85.0 | 相对基准的最大倾角 |
-| `SPEED_GAIN` | 1.16 | **整体提速系数**（见下） |
+| `SPEED_GAIN` | 1.40 | **整体提速系数**（见 7.2） |
 | `CURVE_ARM_RATIO` | 0.85 | 出缝后内切贝塞尔的控制臂比例（见第 7.1 节） |
 | `SAMPLE_STEP` | 8.0 | 路径采样步长 |
 | `KI_HEIGHT` | 0.25 | 高度误差积分速率（见 7.4；原 0.04 太慢） |
@@ -285,6 +302,15 @@ v6 换成**一条**与两端切向都连续的三次贝塞尔：
 **平台的硬限幅（推力 50、尾角 ±80）、安全间隙 55、圈数判定一律不改。**
 
 沿革：v5.1 按用户要求 +8%（`1.08`）；v6 用户要求「再快一些」，提到 `1.16`。
+
+**v7.2 提速到 `1.40`**（用户要求进 15 秒）。依据来自真实遥测，不是猜测：
+实测航迹 7481mm、平均约 397mm/s、**峰值仅 483mm/s**，而命令目标速度高达
+650mm/s —— **命令速度根本不是瓶颈**，鱼跑不到命令速度。胸鳍推力实测中位也
+只有 14（上限 50）。所以唯一的推进杠杆是尾摆，频率 4.4 → 5.3Hz、幅值 +21%。
+
+> 若尾摆加到头仍不提速，说明撞上了平台蓝图 `VelLimit` 的轴速度上限
+> （`test.py` 顶部注释早提到过这一点）。那时提速只能靠**缩短路径**
+> （减小绕圈过冲，见 7.1/7.4 的实测数据）。
 
 三个必须记住的实现细节：
 

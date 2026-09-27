@@ -54,6 +54,15 @@ v7.1：修复"绕第三个障碍物转圈时高度持续增加"（用户反馈�
     积分速率提到 0.25（约 4 秒满偏置，能在一次绕圈内抵消持续扰动）、
     常规俯仰上限 12->18 度，并按 cos(roll) 补偿绕圈横滚造成的翼面竖直效率衰减。
     平飞回归：在目标高度上 ref_vz / pitch / integral 仍恒为 0，不产生多余动作。
+v7.2：继续提速，目标进 15 秒（用户要求；当前实测约 18.9 秒）。
+    实测遥测给出关键结论：**命令速度不是瓶颈**。航迹 7481mm、平均约 397mm/s、
+    峰值仅 483mm/s，而命令目标速度高达 650mm/s —— 鱼根本跑不到命令速度。
+    另外胸鳍推力实测中位仅 14（上限 50），说明推力也没打满。
+    因此把 SPEED_GAIN 1.16 -> 1.40（尾摆频率 4.4->5.3Hz、幅值 +21%）。
+    若尾摆已加到头仍不提速，则说明撞上了平台蓝图的 VelLimit 轴速度上限，
+    那时只能靠缩短路径（减小绕圈过冲）继续优化。
+    同时新增 race_telemetry.csv 自动落盘（见 main()）：跑完即得逐帧遥测，
+    不必再手动导出或转发日志。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -103,7 +112,7 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-start-z'
+PROFILE_NAME = 'race-v7.2-stable' if USE_STABLE_PROFILE else 'race-v7.2-hold-z-1.40'
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -112,7 +121,13 @@ PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-
 # 目标速度数值本身不改变实际推力。真正决定快慢的是**尾摆频率与幅值**
 # （手册：尾摆是主要推进方式，摆动频率与动力成正比）。因此提速必须落到
 # TAIL_STRAIGHT_HZ / TAIL_TURN_HZ / TAIL_AMPLITUDE_* 上，这里统一乘 SPEED_GAIN。
-SPEED_GAIN = 1.16
+#
+# v7.2：用户要求进 15 秒（当前实测约 18.9 秒）。实测航迹 7481mm、平均约 397mm/s，
+# 而命令目标速度高达 650mm/s —— 说明**命令速度根本不是瓶颈**，鱼跑不到命令速度。
+# 唯一可用的推进杠杆就是尾摆，故把系数提到 1.40（尾摆频率/幅值 +21%）。
+# 注意：平台蓝图里有 VelLimit 对各轴速度限幅，若尾摆加到一定程度仍不提速，
+# 说明已撞到该上限，此时只能靠缩短路径（减少过冲）继续优化。
+SPEED_GAIN = 1.40
 # 目标速度不是实际速度。推进器仍限制在50，尾角仍限制在±80度。
 CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
 TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
@@ -541,6 +556,7 @@ class RaceController:
         self.depth = DepthController()
         self.last_yaw = 0.0
         self.pitch_degrees = 0.0
+        self.roll_degrees = 0.0
         self.phase = 0.0
         self.started_at = None
         self.last_at = None
@@ -701,6 +717,7 @@ class RaceController:
         pitch = math.degrees(math.atan2(fz, horizontal_forward))
         self.pitch_degrees = pitch
         roll = (roll+180.0) % 360.0-180.0
+        self.roll_degrees = roll
         if self.started_at is None:
             self.started_at = now
             self.stage_started_at = now
@@ -1306,6 +1323,57 @@ def main():
     last_report = [0.0]
     debug = '--debug' in sys.argv
 
+    # v7.2：自动落一份遥测 CSV，免去"手动把日志发给 AI"这一步。
+    # 每次运行都覆盖写，放在本文件同目录，跑完直接读它就能定位问题。
+    telemetry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'race_telemetry.csv')
+    telemetry = []
+
+    def flat(value, default=0.0):
+        # 平台偶尔给 None 或 NaN；落盘前统一成数字，避免 CSV 里出现 nan 影响分析。
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    def log_frame(fish_info, command):
+        try:
+            telemetry.append((
+                0.0 if controller.started_at is None else controller.last_at-controller.started_at,
+                controller.stage,
+                flat(controller.last_position[0]) if controller.last_position else 0.0,
+                flat(controller.last_position[1]) if controller.last_position else 0.0,
+                flat(controller.last_position[2]) if controller.last_position else 0.0,
+                flat(controller.pitch_degrees), flat(controller.roll_degrees),
+                flat(controller.speed), flat(controller.target_speed),
+                flat(controller.vertical_speed), flat(controller.heading_error),
+                flat(controller.depth.reference_vz), flat(controller.depth.desired_pitch),
+                flat(controller.depth.integral), flat(controller.depth.pitch_trim),
+                flat(command.tail), flat(command.left), flat(command.right),
+                flat(command.left_angle), flat(command.right_angle),
+            ))
+        except (AttributeError, TypeError, ValueError, IndexError):
+            pass
+
+    def save_telemetry():
+        if not telemetry:
+            return
+        header = ('Time(s),Stage,PosX,PosY,PosZ,Pitch(deg),Roll(deg),Speed,TargetSpeed,'
+                  'VerticalSpeed,YawError,RefVz,DesiredPitch,DepthIntegral,PitchTrim,'
+                  'Tail,ThrustL,ThrustR,WingLeft,WingRight')
+        try:
+            with open(telemetry_path, 'w', encoding='utf-8') as handle:
+                handle.write(header + '\n')
+                for row in telemetry:
+                    handle.write(','.join(
+                        item if isinstance(item, str) else '{:.3f}'.format(item)
+                        for item in row) + '\n')
+            print('[race] telemetry -> {} ({} frames)'.format(telemetry_path, len(telemetry)),
+                  flush=True)
+        except (IOError, OSError) as exc:
+            print('[race] telemetry write failed: {}'.format(exc), flush=True)
+
     def publish(command):
         message = mycue.FishCtrlInfo()
         message.tail_target_angel = command.tail
@@ -1332,6 +1400,7 @@ def main():
                 print('[error] {}: {}'.format(type(exc).__name__, exc), flush=True)
                 command = controller.stop('callback_error')
             publish(command)
+            log_frame(fish_info, command)
             if stage_before != controller.stage or (debug and now-last_report[0] >= 1.0):
                 elapsed = 0.0 if controller.started_at is None else now-controller.started_at
                 print('[race] {:.2f}s stage={} pos={} speed={:.1f}/{:.1f} yaw_error={:.1f} slip={:.1f} z_target={:.0f} vz={:.1f} pitch={:.1f}/{:.1f} wings=({:.1f},{:.1f}) laps={} stage_seconds={}'.format(
@@ -1361,9 +1430,11 @@ def main():
                     controller.stop('waiting_timeout')
         print('[race] stopped: {} stage_seconds={} (official result must be checked in simulator)'.format(
             controller.reason, controller.stage_seconds), flush=True)
+        save_telemetry()
     except KeyboardInterrupt:
         with lock:
             publish(controller.stop('interrupted'))
+        save_telemetry()
     finally:
         # 保留subscriber引用直到退出；不要在DDS回调线程内销毁reader。
         with lock:
