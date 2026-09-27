@@ -76,6 +76,41 @@ v7.2：按用户要求「绕圈转向提速 + 全程高度一致（冲突时高�
      corr(速度,半径)=-0.52 说明跑宽反而拖慢（触发回收保护）。
      故把圆周径向增益 2.0→2.8，把圆跟紧——既省里程，又少触发回收。
      平台硬限幅（MAX_THRUST=50、MAX_TAIL=80）、55mm 安全间隙、圈数判定均未放宽。
+v7.3：按用户要求「严格审核"全程保持在起点高度"，并用子智能体核验」。
+     核验方式：两个独立子智能体（一个只读审计、一个对抗性证伪）+ 主控独立复算，
+     全部只读代码/遥测，并复跑两档自测。结论如下，并据此改了 3 个常量：
+     【证实的部分】目标高度唯一：HOLD_Z ≡ START_Z ≡ 340，全文件只有一处
+     `height_error = HOLD_Z - z`，没有第二目标、没有 750 过渡、没有环境变量/档位
+     分支能改高度。平飞（z=340 且 vz=0、姿态水平）时 ref_vz/desired_pitch 恒为 0
+     （2964/2964 帧精确为 0）。坏数据/超时走 stop()，翼角回中性（竖直权限归零）。
+     【证伪的部分】"全程不变"作为不变量不成立，有三条在 z=340 时仍发竖直指令的路径：
+      ① 死区 ±6mm：死区内 height_term 强制为 0，回路无比例作用，**稳态就停在
+         ±6mm**——死区多大，允许的稳态偏差就多大（这是设计层偏差，不是缺陷）；
+      ② 积分/配平残留：任何把 z 推出死区 >1s 的事件之后，即使 z 精确回到 340，
+         首帧仍会输出 +92.7mm/s 竖直目标、+15.1° 俯仰目标，1130 帧（18.8s）才归零；
+      ③ 实测（旧版 1.40 遥测，非当前版本）：orbit_3 段 z ∈ [273.4, 407.4]，
+         偏离 ±67mm，15.2% 的帧偏差 >50mm —— 这是"绕圈持续上浮"的真实量级。
+     【推翻 v7.2 的一条推理】v7.2 按"极限环幅度正比于积分限"把 INTEGRAL_LIMIT
+     30→18。独立复算证明不成立：绕圈时真正顶住权限的是**俯仰配平**，desired_pitch
+     峰值仅约 10.6°、trim 峰值仅 4°、reference_vz 峰值 69mm/s（都没顶到 18°/35°/
+     95mm/s 的上限），积分根本没到 18，所以收小权限对峰值毫无影响；反而把
+     **持续扰动下的稳态偏差放大**：同条件下 18 vs 30 的稳态偏差为 12.7 vs 6.9mm
+     （扰动 50mm/s）、19.2 vs 6.1mm（60mm/s）。实测 forcing 的 p75/p90/p95 =
+     +33/+49/+53mm/s 正落在该区间，故 INTEGRAL_LIMIT 回到 30。
+     【三处改动】（用户明确"冲突时优先保证高度一致"，故全部朝减小偏差方向）
+       · Z_DEADBAND 6.0 → 3.0：直接把允许的稳态偏差从 ±6mm 收到 ±3mm。
+       · KI_HEIGHT 0.25 → 0.50：偏置必须在一次绕圈（约 4s）内建起来。复算：
+         扰动 30/60/90/120mm/s 下的最大偏离由 15.6/31.0/46.5/62.0mm 降到
+         14.2/28.3/42.5/56.6mm；空载纹波仍为 0.00mm（积分变快不会自激）。
+       · INTEGRAL_LIMIT 18.0 → 30.0：见上，是"回退 v7.2 的退化改动"。
+     同时新增自测 test_v7_3_deadband_is_the_real_height_error_budget，把
+     "持续扰动峰值有界 + 扰动撤除后回到死区 + 空载零纹波"钉成回归断言。
+     【必须诚实声明的局限】这个闭环模型是简化的一阶俯仰跟随 + vz=speed·tan(pitch)，
+     用同一模型对实测竖直速度回归只有 R²≈0.45（orbit_3），说明实测竖直运动的
+     一半以上来自模型里没有的力；实测 |roll| 最大仅 3.51°（自测假设 35°），
+     desired_pitch 到 18° 而实际 pitch 只有 3.67°（竖直通道带宽才是真瓶颈）。
+     所以本次改动能保证的是"控制律不再让偏差单调发散、且账面容许偏差收窄"，
+     **不能替代实跑**。真正的竖直带宽问题仍需平台侧验证。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -111,20 +146,23 @@ START_Z = 340.0                   # 鱼的起点高度（由官方起点坐标�
 HOLD_Z = START_Z                  # 全程保持的高度，与起点高度相同
 # 高度保持环参数（v7.1）。绕第三柱连续 2 圈时高度持续爬升，原因是持续扰动
 # 需要一个"持续低头偏置"来抵消，而原实现无法维持这个偏置（详见 DepthController）。
-Z_DEADBAND = 6.0                  # 高度死区：此范围内保持偏置，不做纠偏激励
+# 高度死区（v7.3：6.0 -> 3.0）。死区内 `height_term = 0`，回路完全没有比例
+# 作用，只剩缓慢泄放，所以**稳态就停泊在 ±Z_DEADBAND 上**——死区多大，
+# 允许的稳态偏差就多大。用户要求"始终保持在起点高度"，6mm 的账面偏差不可接受。
+Z_DEADBAND = 3.0                  # 高度死区：此范围内保持偏置，不做纠偏激励
 KP_HEIGHT = 0.9                   # 高度误差 -> 垂直速度目标 的比例
-# 误差积分速率。原值 0.04 建立偏置约需 28 秒，而绕第三柱 2 圈只有约 4 秒，
-# 偏置还没建起来绕圈就结束了 —— 这是高度一路爬升的直接原因。0.25 约 4 秒
-# 满偏置，能在一次绕圈内把持续扰动抵消掉。
-KI_HEIGHT = 0.25
-# v7.2：积分权限由 30 收到 18。实测（race_telemetry.csv，绕第三柱 2 圈）
-# z 在 273~407mm 之间摆动（±67mm），是**积分饱和形成的极限环**：
-# 长时间同号误差把积分顶到 ±30，此时俯仰配平早已贴住 ±35 度上限，
-# 积分却还在累积；等 z 穿过目标高度时积分仍有 +29，于是继续上冲，
-# 然后反向重来 —— 周期约 6.5s，正好是 2 圈的长度。
-# 权限收到 18 后，同样的极限环幅度成比例减小；配合 calculate() 里新增的
-# 反饱和（配平一饱和就停止积分），把摆动压到设计目标以内。
-INTEGRAL_LIMIT = 18.0
+# 误差积分速率（v7.3：0.25 -> 0.50）。绕第三柱 2 圈只有约 4 秒，偏置必须在
+# 这段时间内建起来，否则持续上浮压不住。独立复算（见下）显示：扰动 30/60/90/
+# 120mm/s 下，KI 从 0.25 提到 0.50 把最大偏离从 15.6/31.0/46.5/62.0mm 降到
+# 14.2/28.3/42.5/56.6mm，且空载纹波仍为 0.00mm（不会因为积分变快而自激）。
+KI_HEIGHT = 0.50
+# v7.3：积分权限由 18 回到 30。v7.2 曾按"极限环幅度正比于积分限"把权限收到
+# 18，但独立核验（两个对抗性审计 + 主控复算）证明这条推理不成立：绕圈时真正
+# 顶住上限的是**俯仰配平**（desired_pitch 峰值仅约 10.6 度、trim 峰值 4 度），
+# 积分根本没到 18，所以收小权限对峰值毫无影响，反而把**持续扰动的稳态偏差**
+# 放大了：实测 forcing 的 p75/p90/p95 = +33/+49/+53mm/s，正好落在"权限 18 比
+# 30 更差"的区间（同条件下稳态偏差 12.7 vs 6.9mm）。因此回到 30。
+INTEGRAL_LIMIT = 30.0
 INTEGRAL_LEAK = 1.6               # 到位后偏置泄放速率；过小会让残留偏置拖出反向超调
 PITCH_LIMIT_NORMAL = 18.0         # 常规俯仰上限（原 12 度换算垂直速度约 124mm/s，太紧）
 # 反饱和泄放速率：俯仰配平顶到上限时，积分按此速率往回收（见 DepthController）。
@@ -495,10 +533,17 @@ class DepthController:
         self.roll_trim = 0.0
 
     def reset_dynamics(self):
-        # 通信间断后不使用旧姿态差分；保留胸鳍角度以避免重连瞬间跳变。
+        # 通信间断后不使用旧姿态差分。
         self.last_pitch = self.last_roll = None
         self.pitch_rate = self.roll_rate = 0.0
         self.integral = self.reference_vz = 0.0
+        # v7.2：**必须同时清掉配平残留**。原先只清积分、故意保留胸鳍角度
+        # "避免重连瞬间跳变"，但那会让一个陈旧的大配平挂在新一轮控制上：
+        # 实测建立 trim=35 后调 reset_dynamics()，复位首帧即便鱼正好在
+        # HOLD_Z 且姿态水平，仍会输出 +33.67 度翼偏（非零竖直力），
+        # 与"始终保持在起点高度"直接冲突。这里改为让配平在复位后从 0 重新建立；
+        # 侧滑/侧倾的平滑性由下面的 slew 限速保证，不会产生角度跳变。
+        self.pitch_trim = self.roll_trim = 0.0
 
     @staticmethod
     def vertical_component(angle, pitch=0.0, roll=0.0):
@@ -941,6 +986,27 @@ def self_test():
             command = c.calculate(info(x=1200.0), now=2.0)
             self.assertEqual((command.tail, command.left, command.right), (0.0, 0.0, 0.0))
 
+        def test_v7_2_reset_dynamics_clears_stale_trim(self):
+            """v7.2：断流重连后不得带着陈旧配平（否则 z=HOLD_Z 时仍发竖直指令）。"""
+            d = DepthController()
+            # 低速大偏差 -> 配平必然饱和，制造一个"陈旧大配平"
+            for _ in range(600):
+                d.calculate(HOLD_Z-60.0, 0.0, 0.0, 0.0, 220.0, 1.0/60.0)
+            self.assertAlmostEqual(abs(d.pitch_trim), 35.0, places=3)
+            d.reset_dynamics()
+            # 复位必须把配平残留一并清掉
+            self.assertAlmostEqual(d.pitch_trim, 0.0, places=9)
+            self.assertAlmostEqual(d.roll_trim, 0.0, places=9)
+            self.assertAlmostEqual(d.integral, 0.0, places=9)
+            self.assertAlmostEqual(d.reference_vz, 0.0, places=9)
+            # 关键断言：复位后首帧，鱼正好在起点高度且姿态水平 -> 翼角必须中性
+            left, right = d.calculate(HOLD_Z, 0.0, 0.0, 0.0, 583.0, 1.0/60.0)
+            self.assertAlmostEqual(left, WING_NEUTRAL, places=9)
+            self.assertAlmostEqual(right, WING_NEUTRAL, places=9)
+            # 且不得因此产生任何竖直指令
+            self.assertAlmostEqual(d.reference_vz, 0.0, places=9)
+            self.assertAlmostEqual(d.desired_pitch, 0.0, places=9)
+
         def test_v7_2_anti_windup_stops_integral_when_trim_saturated(self):
             """v7.2：俯仰配平饱和时必须停止积分累积，避免加深超调。"""
             def driven(bleed, steps=600, offset=-60.0):
@@ -966,9 +1032,42 @@ def self_test():
             for _ in range(180):
                 on.calculate(HOLD_Z, 0.0, 0.0, 0.0, 583.0, 1.0/60.0)
             self.assertLess(abs(on.integral), 1.0)
-            # 权限本身也要比 v7.1 更收敛
-            self.assertLessEqual(INTEGRAL_LIMIT, 20.0)
+            # v7.3：权限回到 30。独立核验证明"极限环幅度正比于积分限"不成立
+            # （绕圈时真正贴顶的是俯仰配平，desired_pitch 峰值仅约 10.6 度），
+            # 而权限收小反而放大了持续扰动下的稳态偏差，故必须 >= 30。
+            self.assertGreaterEqual(INTEGRAL_LIMIT, 30.0)
             self.assertGreater(INTEGRAL_LEAK, 1.0)
+
+        def test_v7_3_deadband_is_the_real_height_error_budget(self):
+            """v7.3：死区内没有比例作用，稳态就停在 ±Z_DEADBAND；必须收紧。"""
+            # 死区是"允许的稳态高度偏差"的上界，收紧才配得上"始终保持在起点高度"。
+            self.assertLessEqual(Z_DEADBAND, 3.0)
+            self.assertGreater(Z_DEADBAND, 0.0)
+            # 积分必须够快，才能在一次绕圈（约 4s）内把持续上浮偏置建起来。
+            self.assertGreaterEqual(KI_HEIGHT, 0.5)
+            # 关键行为断言：持续上浮扰动下偏差有界，且扰动撤除后能回到死区内。
+            def closed_loop(disturb_vz, disturbed=360, steps=1800):
+                d = DepthController()
+                z, vz, pitch = HOLD_Z, 0.0, 0.0
+                dt, roll, speed = 1.0/60.0, 3.5, 583.0
+                worst = 0.0
+                for i in range(steps):
+                    d.calculate(z, vz, pitch, roll, speed, dt)
+                    pitch += (d.desired_pitch-pitch)*(dt/(0.35+dt))
+                    vz = (speed*math.tan(math.radians(pitch))*math.cos(math.radians(roll))
+                          + (disturb_vz if i < disturbed else 0.0))
+                    z += vz*dt
+                    worst = max(worst, abs(z-HOLD_Z))
+                return worst, abs(z-HOLD_Z)
+
+            # 实测 forcing 的 p95 约 +53mm/s；这里取 60mm/s 留余量。
+            worst, residual = closed_loop(60.0)
+            self.assertLess(worst, 40.0)       # 全程最大偏离（含绕圈段）
+            self.assertLess(residual, 8.0)     # 扰动撤除后必须回到死区附近
+            # 空载（正常平飞）时不得因为积分变快而产生任何纹波。
+            worst_idle, residual_idle = closed_loop(0.0)
+            self.assertEqual(worst_idle, 0.0)
+            self.assertEqual(residual_idle, 0.0)
 
         def test_v7_2_orbit_speed_boost_keeps_height_authority(self):
             """绕圈提速必须仍留有足够俯仰/配平权限来保高度（高度优先）。"""
