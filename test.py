@@ -8,7 +8,7 @@
   2) 绕圈方向统一为逆时针（CCW，俯视 XY 平面角度递增）
   3) 障碍2 采用 S 形绕过（先左弯贴南侧、再右弯甩出，不绕圈）
   4) 障碍3 逆时针 2 圈，使用实际位置累计角度，不按路径索引猜圈数
-  5) 保持中层高度、水平姿态，向16秒目标优化（比赛上限60秒）
+  5) 高度锁定为鱼的起点高度（340），全程保持该高度不变，水平姿态
 
 场地坐标（由使用手册 + 历史轨迹 fish_debug_log.csv + 地图数据确认）：
   水池 3000(x) * 2000(y) * 1500(z)，水底中心 (0,0,0)
@@ -38,6 +38,33 @@ v6：① 提速系数 1.08 -> 1.16（用户要求"再快一些"）。
     新版出缝后 52mm 就出现向内趋势，到第三柱西侧已完成 70% 横移，
     且最大曲率 1/222 低于绕圈曲率 1/200（不触发曲率限速、无急拐），
     路径还短了 48mm，entry_guard 也不再触发。
+v7：高度锁定为"鱼的起点高度"（用户要求）。
+    起点 (-1250, 0, 340) 在画面下半部分；旧版把目标高度设成 750（水池中层），
+    开局要先爬升到中层，多花时间、多一次姿态调整。现在 HOLD_Z = START_Z = 340，
+    开赛即处于目标高度：高度误差恒为0，垂直速度目标与俯仰目标恒为0，
+    不会出现"先移动到画面中间"或"再调整回中间高度"的动作。
+    绕障、穿缝、绕圈全程都保持该高度。
+v7.1：修复"绕第三个障碍物转圈时高度持续增加"（用户反馈）。
+    根因不是目标高度，而是高度环**守不住持续低头偏置**：
+      ① 积分只在 12~160mm 误差区间累积，误差一回到死区就把偏置泄放掉；
+      ② 积分上限仅 ±12（换算低头约 4 度）；
+      ③ 积分速率 0.04 建立偏置要约 28 秒，而绕第三柱 2 圈只有约 4 秒，
+         偏置还没建起来绕圈就结束了 —— 这是高度一路爬升的直接原因。
+    修法：死区内**保持**偏置（只按小系数泄放）、积分上限放宽到 ±30、
+    积分速率提到 0.25（约 4 秒满偏置，能在一次绕圈内抵消持续扰动）、
+    常规俯仰上限 12->18 度，并按 cos(roll) 补偿绕圈横滚造成的翼面竖直效率衰减。
+    平飞回归：在目标高度上 ref_vz / pitch / integral 仍恒为 0，不产生多余动作。
+v7.2：按用户要求做两件事。
+     ① 确认高度统一在鱼的起点高度：目标高度仍是 HOLD_Z = START_Z = 340，
+        v7/v7.1 已实现，本次未再改动高度逻辑，仅作回归确认。
+     ② 只提速「每次绕圈转向」（不动巡航与穿缝）：新增 TURN_SPEED_BOOST = 1.34，
+        按平方放大 TURN_ACCEL_BUDGET（曲率限速是 sqrt(预算)，平方放大才能
+        等比提速）、等比抬高 TAIL_TURN_HZ（尾摆频率与动力成正比，是真正的
+        推进杠杆），并同步抬高 ORBIT_RECAPTURE_THRUST，避免绕圈一偏出圆周
+        就被钳回旧的低推力而抵消收益。TAIL_AMPLITUDE_TURN 只 +15%，因为
+        tail 会被 (MAX_TAIL-|correction|) 裁剪，幅值加过头会变形。
+        效果（快档）：绕圈目标速度 626->839mm/s、尾摆 4.18->5.60Hz、
+        回收推力 32.5->43.5，平台硬限幅与 55mm 安全间隙均未放宽。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -65,13 +92,29 @@ PILLAR_HALF_DIAG = 141.5          # 200x200 柱子的半对角线
 USE_STABLE_PROFILE = '--stable' in sys.argv
 LOOP_R = 210.0 if USE_STABLE_PROFILE else 200.0  # 快档方柱角间隙约59，仍校验>=55
 SAMPLE_STEP = 8.0                 # 路径采样步长
-TARGET_Z = 750.0                  # 1500高水池的中层；起点340，平缓进入中层
+# v7：高度锁定为起点高度，全程不变。
+# 起点 (-1250, 0, 340) 在画面下半部分；旧版以 750（水池中层）为目标高度，
+# 开局要先爬升到中层，既多花时间又多一次姿态调整。现在直接以起点高度为
+# 目标高度，开赛即处于目标高度，不需要任何"过渡到中层"的动作。
+START_Z = 340.0                   # 鱼的起点高度（由官方起点坐标确认）
+HOLD_Z = START_Z                  # 全程保持的高度，与起点高度相同
+# 高度保持环参数（v7.1）。绕第三柱连续 2 圈时高度持续爬升，原因是持续扰动
+# 需要一个"持续低头偏置"来抵消，而原实现无法维持这个偏置（详见 DepthController）。
+Z_DEADBAND = 6.0                  # 高度死区：此范围内保持偏置，不做纠偏激励
+KP_HEIGHT = 0.9                   # 高度误差 -> 垂直速度目标 的比例
+# 误差积分速率。原值 0.04 建立偏置约需 28 秒，而绕第三柱 2 圈只有约 4 秒，
+# 偏置还没建起来绕圈就结束了 —— 这是高度一路爬升的直接原因。0.25 约 4 秒
+# 满偏置，能在一次绕圈内把持续扰动抵消掉。
+KI_HEIGHT = 0.25
+INTEGRAL_LIMIT = 30.0             # 积分权限（原 ±12 换算成低头仅约 4 度，不够）
+INTEGRAL_LEAK = 1.0               # 到位后偏置泄放速率；过大残留偏置会导致反向超调
+PITCH_LIMIT_NORMAL = 18.0         # 常规俯仰上限（原 12 度换算垂直速度约 124mm/s，太紧）
 WING_NEUTRAL = -90.0             # 胸鳍的UpVector在此角度沿鱼身+x
 MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒推半球
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v6-stable-xy' if USE_STABLE_PROFILE else 'race-v6-immediate-inward'
+PROFILE_NAME = 'race-v7.2-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7.2-hold-z-orbit-boost'
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -81,27 +124,53 @@ PROFILE_NAME = 'race-v6-stable-xy' if USE_STABLE_PROFILE else 'race-v6-immediate
 # （手册：尾摆是主要推进方式，摆动频率与动力成正比）。因此提速必须落到
 # TAIL_STRAIGHT_HZ / TAIL_TURN_HZ / TAIL_AMPLITUDE_* 上，这里统一乘 SPEED_GAIN。
 SPEED_GAIN = 1.16
+# v7.2：只针对「绕圈转向」再提速（用户要求：提升每次绕圈转向的速度）。
+#
+# 绕圈时的目标速度由曲率限速 sqrt(TURN_ACCEL_BUDGET/曲率) 给出，
+# 在快档 LOOP_R=200 处等于 626.8，**它是真正的约束**（TURN_SPEED 上限 626.4
+# 两者几乎同时触顶，所以只抬 cap 无效，必须同时抬预算）。因此这里单独抬「转弯档」，
+# 不动整体 SPEED_GAIN —— 巡航、穿缝、绕行半径都不受影响：
+#   ① TURN_ACCEL_BUDGET ×BOOST²：曲率限速是 sqrt(预算)，预算按平方放大，
+#      绕圈目标速度才真正到 BOOST 倍（这是绕圈转向提速的主杠杆）；
+#   ② TAIL_TURN_HZ ×BOOST：手册说尾摆频率与动力成正比，绕圈时 turning=True
+#      用的正是这一组频率，是真正的推进手段；
+#   ③ TAIL_AMPLITUDE_TURN 只小幅 +15%（见下方注释，加大会被 MAX_TAIL 裁掉）；
+#   ④ ORBIT_RECAPTURE_THRUST ×BOOST：否则一偏出圆周就被钳到旧的低值，
+#      把上面三条的收益直接抵消（这正是绕圈跑不快的实测原因）。
+# 平台硬限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙 55、圈数判定均不放宽。
+# 注：弯道前馈 feedforward = 0.15*degrees(speed*曲率) 会随绕圈速度抬高**自动**
+# 变大（626->839 使前馈由 26.9° 升到 30° 的饱和上限），所以无需改这个系数。
+TURN_SPEED_BOOST = 1.34
 # 目标速度不是实际速度。推进器仍限制在50，尾角仍限制在±80度。
 CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
-TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
+# 转弯档上限也跟着抬（避免它比抬预算后的曲率限速更早触顶，成了新瓶颈）。
+TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN * TURN_SPEED_BOOST
 GAP_SPEED_BASE = 360.0 if USE_STABLE_PROFILE else 400.0
 GAP_SPEED = GAP_SPEED_BASE * SPEED_GAIN
 # 曲率限速是 sqrt(预算/曲率)，预算只乘一次的话绕圈速度只涨 sqrt(1.08)≈4%，
 # 达不到要求的 8%；因此预算按系数的平方放大。
-TURN_ACCEL_BUDGET = (1150.0 if USE_STABLE_PROFILE else 1460.0) * SPEED_GAIN ** 2
+# v7.2：再叠一个 TURN_SPEED_BOOST²，专门把绕圈转向的目标速度抬上去。
+TURN_ACCEL_BUDGET = (1150.0 if USE_STABLE_PROFILE else 1460.0) * SPEED_GAIN ** 2 * TURN_SPEED_BOOST ** 2
 THRUST_BASE = 48.0 if USE_STABLE_PROFILE else 50.0
 # 手册：尾摆频率与动力成正比，尾摆是主要推进方式；这里是主要提速手段。
 TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN
-TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN
+# 绕圈时的尾摆频率——绕圈转向提速的主要推进手段（见 TURN_SPEED_BOOST 注释）。
+TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN * TURN_SPEED_BOOST
 # 尾摆幅值（同样是推进量）；窄缝内仍收窄，避免摆动导致反复纠偏。
 TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
-TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN
+# 绕圈幅值：只小幅 +15%。原因：tail = correction + amplitude*sin(phase)，
+# calculate() 会按 (MAX_TAIL-|correction|) 裁剪，而绕圈时 |correction| 可达
+# 62°（前馈在提速后顶到 30°，再加上 PID），只剩约 18° 余量。
+# 若把幅值也乘 1.34 到 28°，会被裁剪、反而让波形变形。故频率才是主杠杆。
+TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN * 1.15
 GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
 # 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
 GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
 GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
 # 绕圈偏离圆周后重新贴回的推力上限（安全限幅，只按系数微调）。
-ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
+# 必须跟 TURN_SPEED_BOOST 一起抬：否则绕圈一偏出圆周就被钳回旧值，
+# 抬高转弯速度/尾摆的收益会被这条保护直接抵消。
+ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN * TURN_SPEED_BOOST
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -431,26 +500,46 @@ class DepthController:
             self.roll_rate += alpha*(measured-self.roll_rate)
         self.last_pitch, self.last_roll = pitch, roll
 
-        height_error = TARGET_Z-z
-        # 中层附近才积累小幅偏置；远距离爬升和大姿态恢复时禁止积分饱和。
-        if 12.0 < abs(height_error) < 160.0 and abs(pitch) < 20.0:
-            self.integral = _constrain(self.integral+0.04*height_error*dt, -12.0, 12.0)
+        height_error = HOLD_Z-z
+        # v7.1：绕第三柱连续 2 圈时高度持续爬升。原因是"持续扰动需要持续低头偏置
+        # 来抵消"，而旧实现守不住这个偏置：①只在 12~160mm 误差区间积分，误差一
+        # 回到死区内就把偏置泄放掉，于是偏置刚建立就被抹掉；②积分上限只有 ±12，
+        # 换算成低头只有约 4 度，权限不足以压住持续上浮。
+        # 现在：死区内**保持**偏置（只做很慢的泄放），并放宽积分权限。
+        if abs(height_error) < Z_DEADBAND:
+            # 已在目标高度附近：保留已建立的偏置，仅按 INTEGRAL_LEAK 缓慢泄放，
+            # 这样持续扰动期间偏置守得住，扰动消失后也能自然退回零配平。
+            self.integral *= max(0.0, 1.0 - INTEGRAL_LEAK*dt)
+        elif abs(height_error) < 160.0 and abs(pitch) < 20.0:
+            self.integral = _constrain(
+                self.integral+KI_HEIGHT*height_error*dt,
+                -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
         else:
-            self.integral *= max(0.0, 1.0-dt)
-        height_term = 0.0 if abs(height_error) <= 12.0 else height_error
-        wanted_vz = _constrain(0.9*height_term+self.integral, -95.0, 95.0)
-        # 起点到中层不突跃：逐步增加垂直速度目标，边前进边到达巡航高度。
-        self.reference_vz += _constrain(wanted_vz-self.reference_vz, -100.0*dt, 100.0*dt)
+            # 大偏差或大姿态：停止继续积分，但不立即清零，避免偏置反复重建。
+            self.integral *= max(0.0, 1.0-0.5*dt)
+        height_term = 0.0 if abs(height_error) <= Z_DEADBAND else height_error
+        wanted_vz = _constrain(KP_HEIGHT*height_term+self.integral, -95.0, 95.0)
+        # 垂直速度目标仍做斜率限制，避免姿态突跃；但开局已处于目标高度，
+        # height_error≈0，因此这里不会产生任何爬升动作。
+        self.reference_vz += _constrain(wanted_vz-self.reference_vz, -140.0*dt, 140.0*dt)
         vertical_command = self.reference_vz + 0.7*(self.reference_vz-vertical_speed)
-        pitch_limit = 20.0 if z < 180.0 or z > 1200.0 else 12.0
+        # 靠底/靠顶时放宽，便于姿态异常时恢复；常规高度上给足 18 度权限。
+        pitch_limit = 20.0 if z < 180.0 or z > 1200.0 else PITCH_LIMIT_NORMAL
         self.desired_pitch = _constrain(
             math.degrees(math.atan2(vertical_command, max(220.0, speed))),
             -pitch_limit, pitch_limit)
 
         recovering = abs(pitch) > 30.0 or abs(roll) > 40.0
         trim_limit = 65.0 if recovering else 35.0
+        # 横滚会让翼面竖直效率按 cos(roll) 衰减（绕圈时鱼体持续横滚），
+        # 若不补偿，同样的俯仰修正只能换回一部分竖直力，高度就压不住。
+        # 按 cos(roll) 放宽上限做补偿，最多放大 1.67 倍，并收口在物理倾角内。
+        authority = max(math.cos(math.radians(roll)), 0.6)
         pitch_trim = _constrain(
-            2.0*(self.desired_pitch-pitch)-0.9*self.pitch_rate, -trim_limit, trim_limit)
+            2.0*(self.desired_pitch-pitch)-0.9*self.pitch_rate,
+            -trim_limit/authority, trim_limit/authority)
+        pitch_trim = _constrain(pitch_trim,
+                                -MAX_WING_TILT+5.0, MAX_WING_TILT-5.0)
         # UE正Roll时右侧下沉，需要右胸鳍多给上分力，而非增加右侧前向推力。
         roll_trim = _constrain(0.65*roll+0.25*self.roll_rate,
                                -18.0 if recovering else -12.0,
@@ -806,7 +895,7 @@ def self_test():
             self.assertEqual(p.angle, 0.0)
 
         def test_limits_and_depth(self):
-            for z in (150.0, 340.0, TARGET_Z, 800.0, 1300.0):
+            for z in (150.0, START_Z, HOLD_Z, 800.0, 1300.0):
                 c = RaceController()
                 command = c.calculate(info(z=z), now=1.0)
                 self.assertLessEqual(abs(command.tail), MAX_TAIL)
@@ -814,9 +903,9 @@ def self_test():
                 self.assertLessEqual(abs(command.right), MAX_THRUST)
                 self.assertLessEqual(abs(command.left_angle-WING_NEUTRAL), MAX_WING_TILT)
                 vertical = DepthController.vertical_component(command.left_angle)
-                if z > TARGET_Z:
+                if z > HOLD_Z:
                     self.assertLess(vertical, 0.0)
-                if z < TARGET_Z:
+                if z < HOLD_Z:
                     self.assertGreater(vertical, 0.0)
 
         def test_finish_is_latched(self):
@@ -827,6 +916,46 @@ def self_test():
             self.assertEqual(c.reason, 'crossed_finish')
             command = c.calculate(info(x=1200.0), now=2.0)
             self.assertEqual((command.tail, command.left, command.right), (0.0, 0.0, 0.0))
+
+        def test_v7_1_holds_height_during_sustained_orbit_climb(self):
+            """用户反馈：绕第三个障碍物转圈时高度持续增加，需要压住。"""
+            # 用最小闭环复现"绕圈时被持续上浮"：俯仰一阶跟随，竖直速度由俯仰产生
+            # 并叠加一个持续上浮扰动（绕圈时鱼体横滚、翼面竖直效率下降也会等效成它）。
+            def closed_loop(roll, disturb_vz, steps=420, speed=583.0):
+                d = DepthController()
+                z, vz, pitch, dt = HOLD_Z, 0.0, 0.0, 1.0/60.0
+                peak = 0.0
+                for _ in range(steps):
+                    d.calculate(z, vz, pitch, roll, speed, dt)
+                    efficiency = max(math.cos(math.radians(roll)), 0.0)
+                    pitch += (d.desired_pitch-pitch)*(dt/(0.35+dt))
+                    vz = speed*math.tan(math.radians(pitch))*efficiency + disturb_vz
+                    z += vz*dt
+                    peak = max(peak, z-HOLD_Z)
+                return z-HOLD_Z, peak
+
+            # 绕圈时鱼体横滚 35 度，持续上浮 60mm/s（约 4 秒 = 绕 2 圈的量级）。
+            residual, peak = closed_loop(roll=35.0, disturb_vz=60.0)
+            # 关键：不允许持续发散。峰值有界，稳态不再继续累积。
+            self.assertLess(peak, 60.0)
+            self.assertLess(residual, 40.0)
+            # 同样扰动下，竖直增益足够把偏置建立起来（积分达到可用量级）。
+            d = DepthController()
+            for _ in range(240):
+                d.calculate(HOLD_Z-30.0, 30.0, 0.0, 0.0, 583.0, 1.0/60.0)
+            self.assertGreater(abs(d.integral), 12.0)
+            # 扰动消失后必须能回到目标高度，不留稳态偏差。
+            d = DepthController()
+            z, vz, pitch = HOLD_Z, 0.0, 0.0
+            dt = 1.0/60.0
+            for i in range(900):
+                disturb = 60.0 if i < 240 else 0.0
+                d.calculate(z, vz, pitch, 35.0, 583.0, dt)
+                efficiency = max(math.cos(math.radians(35.0)), 0.0)
+                pitch += (d.desired_pitch-pitch)*(dt/(0.35+dt))
+                vz = 583.0*math.tan(math.radians(pitch))*efficiency + disturb
+                z += vz*dt
+            self.assertLess(abs(z-HOLD_Z), 25.0)
 
         def test_bad_data_and_timeout(self):
             c = RaceController()
@@ -883,6 +1012,40 @@ def self_test():
             after = c._motion_profile(0.0, 40.1, -1100.0, 0.0)[0]
             self.assertLess(abs(before-after), 0.2)
             self.assertLessEqual(c._motion_profile(0.0, 140.0, -1100.0, 0.0)[0], 10.0)
+
+        def test_v7_2_orbit_turning_speed_boost(self):
+            """用户要求：提升每次绕圈转向的速度（模块级专项提速）。"""
+            base_cap = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN
+            # 绕圈目标速度上限必须高于「只乘 SPEED_GAIN」的那一档。
+            self.assertGreater(TURN_SPEED, base_cap)
+            boost = TURN_SPEED / base_cap
+            self.assertGreaterEqual(boost, 1.25)
+            # 曲率限速是 sqrt(预算/曲率)：预算按 boost^2 放大，
+            # 在绕行半径处才真正给出 boost 倍的目标速度。
+            self.assertAlmostEqual(
+                TURN_ACCEL_BUDGET, (1150.0 if USE_STABLE_PROFILE else 1460.0)
+                * SPEED_GAIN ** 2 * boost ** 2, places=6)
+            c = RaceController()
+            c.speed = 500.0
+            c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], OBS1[1]-LOOP_R)
+            self.assertGreaterEqual(c.target_speed, base_cap * 1.25)
+            self.assertLessEqual(c.target_speed, TURN_SPEED)
+            # 绕圈尾摆频率同步抬升 —— 手册：尾摆频率与动力成正比，是真正的推进杠杆。
+            self.assertAlmostEqual(
+                TAIL_TURN_HZ,
+                (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN * boost, places=6)
+            # 回收保护必须同步抬，否则绕圈一偏出圆周就被钳回旧值、收益被抵消。
+            self.assertGreater(ORBIT_RECAPTURE_THRUST, 28.0 * SPEED_GAIN)
+            self.assertLessEqual(ORBIT_RECAPTURE_THRUST, MAX_THRUST)
+            # 幅值会被 (MAX_TAIL-|correction|) 裁剪，故只要求不低于旧值，
+            # 保证裁剪后的有效幅值不会比提速前更小。
+            self.assertGreaterEqual(TAIL_AMPLITUDE_TURN, 18.0 * SPEED_GAIN)
+            # 平台硬限幅与安全间隙不得放宽。
+            self.assertEqual(MAX_THRUST, 50.0)
+            self.assertEqual(MAX_TAIL, 80.0)
+            for a, b in zip(generate_sections()[3].points,
+                            generate_sections()[3].points[1:]):
+                self.assertGreaterEqual(segment_clearance(a, b, OBS3), 55.0)
 
         def test_gap_fast_only_when_aligned(self):
             c = RaceController()
@@ -1091,15 +1254,42 @@ def self_test():
         def test_level_hold_has_no_upward_thrust(self):
             d = DepthController()
             for _ in range(120):
-                left, right = d.calculate(TARGET_Z, 0.0, 0.0, 0.0, 400.0, 1.0/60.0)
+                left, right = d.calculate(HOLD_Z, 0.0, 0.0, 0.0, 400.0, 1.0/60.0)
                 self.assertAlmostEqual(left, WING_NEUTRAL)
                 self.assertAlmostEqual(right, WING_NEUTRAL)
                 self.assertAlmostEqual(d.desired_pitch, 0.0)
 
+        def test_v7_holds_start_height_all_the_way(self):
+            """用户要求：高度锁定为鱼的起点高度，全程不变，不做中过渡。"""
+            # 目标高度就是起点高度本身，不是水池中层。
+            self.assertEqual(HOLD_Z, START_Z)
+            self.assertEqual(HOLD_Z, 340.0)
+            # 开局即处于目标高度：不应出现任何爬升/下沉意图。
+            d = DepthController()
+            for _ in range(240):
+                left, right = d.calculate(START_Z, 0.0, 0.0, 0.0, 560.0, 1.0/60.0)
+                self.assertAlmostEqual(d.reference_vz, 0.0)
+                self.assertAlmostEqual(d.desired_pitch, 0.0)
+            self.assertAlmostEqual(left, WING_NEUTRAL)
+            self.assertAlmostEqual(right, WING_NEUTRAL)
+            # 沿整条名义路线（含绕圈、穿缝）都保持起点高度，全程无高度变化。
+            c = RaceController()
+            now = 1.0
+            for section in generate_sections():
+                for x, y, heading in section.points:
+                    now += 0.02
+                    command = c.calculate(info(x=x, y=y, z=START_Z, yaw=heading), now=now)
+                    pitch = c.depth.desired_pitch
+                    # 高度误差恒为0，所以垂直指令和俯仰目标都应恒为0。
+                    self.assertAlmostEqual(c.depth.reference_vz, 0.0)
+                    self.assertAlmostEqual(pitch, 0.0)
+                    self.assertLessEqual(abs(command.left_angle-WING_NEUTRAL), MAX_WING_TILT)
+            self.assertEqual(c.reason, 'crossed_finish')
+
         def test_ascent_braking_and_pitch_recovery(self):
             d = DepthController()
             for _ in range(60):
-                left, right = d.calculate(TARGET_Z, 100.0, 20.0, 0.0, 400.0, 1.0/60.0)
+                left, right = d.calculate(HOLD_Z, 100.0, 20.0, 0.0, 400.0, 1.0/60.0)
             self.assertLess(d.desired_pitch, 0.0)
             self.assertLess(d.pitch_trim, 0.0)
             self.assertLess(DepthController.vertical_component(left, pitch=20.0), 0.0)
@@ -1108,7 +1298,7 @@ def self_test():
         def test_roll_correction_uses_angle_not_horizontal_force(self):
             for roll in (-20.0, 20.0):
                 c = RaceController()
-                command = c.calculate(info(z=TARGET_Z, roll=roll), now=1.0)
+                command = c.calculate(info(z=HOLD_Z, roll=roll), now=1.0)
                 self.assertAlmostEqual(command.left, command.right)
                 left_z = DepthController.vertical_component(command.left_angle, roll=roll)
                 right_z = DepthController.vertical_component(command.right_angle, roll=roll)
@@ -1135,7 +1325,7 @@ def self_test():
             c = RaceController()
             c.section_index = len(c.sections)-1
             c.tracker = PathTracker(c.sections[-1].points)
-            c.calculate(info(x=1260.0, z=TARGET_Z), now=1.0)
+            c.calculate(info(x=1260.0, z=HOLD_Z), now=1.0)
             self.assertEqual(c.reason, 'crossed_finish')
 
         def test_invalid_forward_still_stops(self):
@@ -1218,7 +1408,7 @@ def main():
                 print('[race] {:.2f}s stage={} pos={} speed={:.1f}/{:.1f} yaw_error={:.1f} slip={:.1f} z_target={:.0f} vz={:.1f} pitch={:.1f}/{:.1f} wings=({:.1f},{:.1f}) laps={} stage_seconds={}'.format(
                     elapsed, controller.stage, controller.last_position,
                     controller.speed, controller.target_speed, controller.heading_error,
-                    math.degrees(controller.course_slip), TARGET_Z, controller.vertical_speed,
+                    math.degrees(controller.course_slip), HOLD_Z, controller.vertical_speed,
                     controller.pitch_degrees, controller.depth.desired_pitch,
                     command.left_angle, command.right_angle, controller.completed_laps,
                     controller.stage_seconds), flush=True)
@@ -1229,8 +1419,8 @@ def main():
     publisher = mycue.publisher(mycue.FishCtrlInfo)
     subscriber = mycue.subscriber(mycue.FishInfo, lcb)
     waiting_since = time.monotonic()
-    print('[race] {} ready: 1 CCW lap -> S passage -> 2 CCW laps -> finish; z_target={} wing_neutral={}'.format(
-        PROFILE_NAME, TARGET_Z, WING_NEUTRAL), flush=True)
+    print('[race] {} ready: 1 CCW lap -> S passage -> 2 CCW laps -> finish; hold_z={} wing_neutral={}'.format(
+        PROFILE_NAME, HOLD_Z, WING_NEUTRAL), flush=True)
     try:
         while not controller.finished:
             time.sleep(0.05)
