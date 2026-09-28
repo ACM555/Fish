@@ -111,6 +111,42 @@ v7.3：按用户要求「严格审核"全程保持在起点高度"，并用子�
      desired_pitch 到 18° 而实际 pitch 只有 3.67°（竖直通道带宽才是真瓶颈）。
      所以本次改动能保证的是"控制律不再让偏差单调发散、且账面容许偏差收窄"，
      **不能替代实跑**。真正的竖直带宽问题仍需平台侧验证。
+v7.4：按用户要求「把绕第一个柱子的方法用在绕第三个柱子上」（用户明显观察到两柱绕法不同）。
+     先用穷尽扫描确认了**绕圈本身两处完全同源**：_guidance 只有一条 `self.orbit is not None`
+     分支，没有按阶段分叉；两段同为 LOOP_R=200、逆时针、OrbitProgress 按实际轨迹累计角度。
+     差异全部来自**入圈那一段的几何**（这也正是"撞第三柱一下才开始绕圈"的成因）：
+       · 第一柱 approach_1 的贝塞尔控制臂 = 190（起点切线）/ 290（入圈切线）；
+       · 第三柱 slalom_2 原用 CURVE_ARM_RATIO=0.85R = 170 / 170。
+     侧写对比（距入圈点 : 半径 / 切向偏角）说明前者是"沿切线远远溜进来"，
+     后者是"贴着圆斜插进去"：
+       距入圈点   第1柱(改不改都一样)   第3柱(改前)     第3柱(改后)
+         120mm     222 / +19.0°        210 / +13.1°    221 / +19.7°
+         320mm     311 / +34.6°        309 / +45.5°    322 / +38.9°
+     入圈瞬间的向内径向速度（按实测 330mm/s 折算）：改前 +84~131mm/s，
+     改后 +15.7mm/s，与第一柱的 +16.1mm/s 基本一致。径向冲量正是把圆跑大、
+     触发径向回收、看起来"撞一下才开始绕"的直接原因。
+     代价可忽略：最大曲率 1/222 → 1/264（仍低于曲率限速免费阈值 1/200，
+     不触发额外减速），离柱最小间隙仍 75mm（≥55），总路径 6526.9mm（上限 6660）。
+     对应自测：无（几何类断言原样复用：曲率<=1/LOOP_R、无北偏、出缝后立刻向内、
+     y 单调、55mm 间隙、路径长度——全部继续通过）。**未实测，不能保证耗时**。
+v7.5：针对"速度一直卡在 20 秒附近"做定向提速，只动绕圈的径向控制，不动路线与高度。
+     依据来自 race_telemetry.csv（1159 帧实测）与 project1.csv 成绩：
+       ① 绕圈平均半径跑到 230/237mm（计划 200），1+2 圈白跑约 657mm ≈ 2s；
+       ② |径向误差|>40mm 的帧占 orbit_1 47%、orbit_3 54%，全部被硬钳到约 39 推力，
+          速度从 350/358 掉到 251/285，两段合计约损失 3.2s；
+       ③ 径向速度与半径变化率 corr=+1.000，外漂就是圆跑大的直接来源；
+       ④ 反证：test-03（SPEED_GAIN=1.45）与 a1（1.70）实测反而更慢
+          （20.31 / 26.12 秒），说明"再加大驱动"路线已被证伪，问题在径向漂移与回收。
+     三处改动：
+       · 新增 ORBIT_RADIAL_DAMP=0.22：把径向速度折算成等效半径误差，
+         在半径还没跑宽前就往回收（不是事后纠正）。
+       · 回收阈值 40→70，且只在"仍在往外漂"时介入；正在收敛的中度偏离不踩刹车。
+       · 新增硬阈值 ORBIT_RECAPTURE_HARD_BAND=80：严重偏离无论方向一律回收，
+         安全底线不松。
+     实测遥测回放：回收钳制帧从 421/820 降到 48/820（-89%），路径几何逐点未变
+     （总长 6526.9mm、最小离柱间隙 58.5mm、HOLD_Z=340 未动）。
+     对应自测 test_orbit_recapture_limits_thrust / test_orbit_radial_damp_predicts_drift。
+     **未实测，不能保证耗时**；请回传成绩与 stage_seconds。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -223,6 +259,16 @@ GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
 # v7.2 必须同步抬高：实测绕圈有 45%/38% 的帧偏出圆周 >40mm，
 # 一偏出就被钳到这个低值，把绕圈提速的收益直接抵消。
 ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN * TURN_SPEED_BOOST
+# v7.5：径向漂移阻尼 + 分级回收。实测（1159 帧遥测）证明：
+#   ① 绕圈平均半径跑到 230/237mm（计划 200），1+2 圈合计白跑约 657mm ≈ 2s；
+#   ② |径向误差|>40mm 的帧占 orbit_1 47%、orbit_3 54%，这些帧被硬钳到 39 推力，
+#      速度从 350/358 掉到 251/285，本段合计约损失 3.2s；
+#   ③ 径向速度与半径变化率相关性 +1.000 —— 半径变大就是径向外漂直接造成的。
+# 两个结论合起来：**不要再"偏出就踩刹车"**，而是先阻尼径向漂移，
+#   只在"还在往外漂"或严重偏离时才回收推力。
+ORBIT_RADIAL_DAMP = 0.22          # 径向速度阻尼：mm/s -> 等效半径误差 mm
+ORBIT_RECAPTURE_BAND = 70.0       # 漂移恶化时才介入的阈值
+ORBIT_RECAPTURE_HARD_BAND = 80.0  # 无论收敛与否，严重偏离一律回收
 # 切向 + 径向误差反馈里，径向项的增益（原为常数 2.0）。
 # 实测平均半径 236mm（计划 200mm），跑宽 18%，里程白多 4~21%。
 # 1.4 倍后指向圆周更积极，把实际半径拉回计划值附近——
@@ -230,9 +276,22 @@ ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN * TURN_SPEED_BOOST
 ORBIT_RADIAL_GAIN = 2.8
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
-# 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
-# 低于曲率限速的"免费"阈值，因此内切过程不会额外减速，也不会出现急拐。
-CURVE_ARM_RATIO = 0.85
+# v7.4：绕第三柱改用「绕第一柱同款」的入圈方法（用户要求）。
+# 用户观察到两柱绕法明显不同。代码比对证实：绕圈本身（_guidance 的 orbit 分支、
+# LOOP_R=200、逆时针）两处完全同源，差异全部来自**入圈那一段的几何**：
+#   · 第一柱 approach_1 的贝塞尔控制臂 = 起点切线 190 / 入圈切线 290，
+#     入圈前 320mm 处切向偏角仅 34.6 度 —— 沿切线远远溜进来，入圈瞬间径向速度小；
+#   · 第三柱 slalom_2 原来用 0.85R=170 / 170，入圈前 320mm 处偏角 45.5 度，
+#     是"贴着圆斜插进去"，实测入圈瞬间带着 +84~131mm/s 的向内径向速度，
+#     也就是用户看到的"撞第三柱一下才开始绕圈、圆被跑大"。
+# 现在把第三柱的入圈臂改成与第一柱**完全相同的 190 / 290**，两柱入圈侧写重合：
+#   距入圈点 40mm  第1柱 202/+7.2°  第3柱改后 203/+7.3°
+#   距入圈点 120mm 第1柱 222/+19.0° 第3柱改后 221/+19.7°
+# 代价可忽略：slalom_2 最大曲率由 1/222 降到 1/264（均低于曲率限速阈值 1/200，
+# 不触发额外减速），最小离柱间隙 75mm（≥55 安全线），
+# 出缝后 56mm 就出现向内趋势（要求 <120），总路径 6522.3 -> 6526.9mm（上限 6660）。
+ENTRY_ARM_GAP = 190.0             # 出缝点到入圈前控制点的切线臂长
+ENTRY_ARM_ENTRY = 290.0           # 入圈点到入圈后控制点的切线臂长
 
 # ========================== 路径构建工具 ==========================
 
@@ -323,11 +382,13 @@ def generate_sections():
     pb.straight((-190.0, 0.0), (190.0, 0.0))
     # v6：出缝后立刻内切。旧版先向北偏 +35 再俯冲到南侧，
     # 转折点被推到第三柱西侧（x≈450）才出现，所以"到第三柱才开始向里走"。
-    # 现在改用一条与两端切向都连续的三次贝塞尔，从出缝点直接下压到南侧入圈点：
+    # 改用一条与两端切向都连续的三次贝塞尔，从出缝点直接下压到南侧入圈点：
     # 两端切向都是 +x（与直缝、与入圈圆弧相切），曲率上限 1/LOOP_R，
     # 不会触发曲率限速，也不会出现急拐或卡顿。
-    arm = CURVE_ARM_RATIO * LOOP_R
-    pb.bezier((190.0, 0.0), (190.0+arm, 0.0), (OBS3[0]-arm, -LOOP_R), e3)
+    # v7.4：控制臂由 0.85R(170/170) 改为与 approach_1 **同款**的 190/290，
+    # 让绕第三柱的入圈方式和绕第一柱一致（见文件头 ENTRY_ARM_* 说明）。
+    pb.bezier((190.0, 0.0), (190.0+ENTRY_ARM_GAP, 0.0),
+              (OBS3[0]-ENTRY_ARM_ENTRY, -LOOP_R), e3)
     # 终点 e3 正好是 orbit_3 圆弧的起点(270度)，两端切向都是 +x，无需额外圆弧。
     sections.append(PathSection('slalom_2', pb.pts))
 
@@ -701,10 +762,18 @@ class RaceController:
                 self._next_section()
                 return self._guidance(x, y)
             dx, dy = x-section.center[0], y-section.center[1]
-            radius_error = math.hypot(dx, dy) - LOOP_R
+            radius = math.hypot(dx, dy)
+            radius_error = radius - LOOP_R
+            # v7.5：预测径向漂移，不再只对"当前半径误差"做比例反馈。
+            # 实测径向速度与半径变化率 corr=+1.000，外漂速度是半径变大的直接来源；
+            # 把它折算成等效半径误差，能在半径还没跑宽前就往回收。
+            radial_speed = ((self.velocity_x*dx + self.velocity_y*dy)
+                            / max(radius, 1.0))
             # 圆的切向 + 径向误差反馈，比追前瞻弦更不易切入方柱角。
             heading = math.atan2(dy, dx) + math.pi/2
-            heading += math.atan2(ORBIT_RADIAL_GAIN*radius_error, LOOP_R)
+            heading += math.atan2(
+                ORBIT_RADIAL_GAIN*radius_error
+                + ORBIT_RADIAL_DAMP*radial_speed, LOOP_R)
             return _wrap(heading), 1.0/LOOP_R, 1.0/LOOP_R
 
         target = self.tracker.target(x, y)
@@ -776,9 +845,18 @@ class RaceController:
         thrust = min(thrust, steering_cap)
         if self.orbit is not None:
             cx, cy = self.orbit.center
-            radial_error = math.hypot(x-cx, y-cy)-LOOP_R
-            if abs(radial_error) > 40.0:
-                thrust = min(thrust, ORBIT_RECAPTURE_THRUST)  # 偏离圆周后先收回轨迹，再加速
+            radius = math.hypot(x-cx, y-cy)
+            radial_error = radius-LOOP_R
+            # v7.5：分级回收，取代"偏出 40mm 一律踩刹车"。
+            # 实测 47%/54% 的绕圈帧被这条硬阈值钳到 39 推力，速度掉 100mm/s；
+            # 但其中很多帧其实正在往回收敛，踩刹车反而拖慢恢复。
+            # 只有"仍在往外漂"或严重偏离时才回收；收敛中的中度偏离不干预。
+            radial_speed = ((self.velocity_x*(x-cx) + self.velocity_y*(y-cy))
+                            / max(radius, 1.0))
+            drifting_out = radial_error*radial_speed > 0.0
+            if (abs(radial_error) > ORBIT_RECAPTURE_HARD_BAND
+                    or (drifting_out and abs(radial_error) > ORBIT_RECAPTURE_BAND)):
+                thrust = min(thrust, ORBIT_RECAPTURE_THRUST)
         if self.entry_avoidance:
             thrust = min(thrust, ORBIT_RECAPTURE_THRUST)
         turning = curvature > 0.003
@@ -1321,8 +1399,31 @@ def self_test():
             c = RaceController()
             c.section_index = 1
             c.orbit = OrbitProgress(OBS1, 1)
-            thrust = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R-60.0)[0]
-            self.assertLessEqual(thrust, ORBIT_RECAPTURE_THRUST)
+            # v7.5：中度偏离只在"继续往外漂"时才踩刹车；正在收敛时不干预。
+            outside_y = -LOOP_R-80.0   # 80mm > 70mm 漂移阈值，但未到 120mm 硬阈值
+            c.velocity_x, c.velocity_y = 0.0, -300.0   # 径向外漂
+            drifting = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], outside_y)[0]
+            self.assertLessEqual(drifting, ORBIT_RECAPTURE_THRUST)
+            c.velocity_x, c.velocity_y = 0.0, 300.0    # 正在往回收敛
+            converging = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], outside_y)[0]
+            self.assertGreater(converging, ORBIT_RECAPTURE_THRUST)
+            # 严重偏离无论方向一律回收，安全底线不松。
+            hard = c._motion_profile(
+                1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R-ORBIT_RECAPTURE_HARD_BAND-20.0)[0]
+            self.assertLessEqual(hard, ORBIT_RECAPTURE_THRUST)
+
+        def test_orbit_radial_damp_predicts_drift(self):
+            """v7.5：径向外漂必须提前被折算成向内转向，避免半径继续跑大。"""
+            c = RaceController()
+            c.section_index = 1
+            c.orbit = OrbitProgress(OBS1, 1)
+            x, y = OBS1[0], -LOOP_R       # 正好在圆周上
+            c.velocity_x, c.velocity_y = 0.0, -200.0   # 径向外漂
+            outward, _, _ = c._guidance(x, y)
+            c.velocity_x, c.velocity_y = 0.0, 200.0    # 径向内收
+            inward, _, _ = c._guidance(x, y)
+            # 两者都以圆周切向为基准；外漂时应得到更大的向内修正角。
+            self.assertGreater(_wrap(outward-inward), 0.0)
 
         def test_fast_path_length_and_speed_envelope(self):
             length = sum(math.hypot(b[0]-a[0], b[1]-a[1])
