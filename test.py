@@ -147,6 +147,25 @@ v7.5：针对"速度一直卡在 20 秒附近"做定向提速，只动绕圈的�
      （总长 6526.9mm、最小离柱间隙 58.5mm、HOLD_Z=340 未动）。
      对应自测 test_orbit_recapture_limits_thrust / test_orbit_radial_damp_predicts_drift。
      **未实测，不能保证耗时**；请回传成绩与 stage_seconds。
+v7.6：针对"速度一直卡在 20 秒附近"做**转向权限**提速，不再加大驱动。
+     依据来自 race_telemetry.csv（1185 帧）+ 离线运动学仿真（仿真半径/偏航
+     与实测对齐到 237/27°，可用来比策略）：
+       ① 绕圈平均半径 230/237（计划 200），|径向误差|>40mm 的帧占 47%/54%；
+          corr(半径误差, 速度)=-0.76，跑宽就是掉速的直接原因；
+       ② 绕圈 |偏航误差| 均值 25°，PID 已顶到 ±62 钳位，尾摆幅值被
+          (MAX_TAIL-|correction|) 吃掉，推进与转向抢同一根尾巴；
+       ③ 仿真：在现有转向带宽下，lap 时间对"转向权限"最敏感
+          （yaw_tau 0.40→0.22 可把单圈 5.8s 压到 4.5s），而继续抬 SPEED_GAIN
+          只会把圆跑得更宽（1.40/1.70 实测更慢，已证伪）。
+     四处改动（硬限幅/安全间隙/圈数判定仍不动）：
+       · 左右胸鳍差动补转向：尾摆不够的偏航力矩改由推力差承担，
+         不再让振幅和转向互相抢预算；
+       · |偏航误差| 大时收幅值、抬频率：优先把尾巴用在转向，频率补推进；
+       · 绕圈径向增益 2.8→3.2，略收紧圆周；
+       · 尾摆频率小幅上调、绕圈幅值下调（减少锯齿路径）。
+     对应自测 test_yaw_differential_assists_turning /
+     test_steering_priority_reduces_amplitude_when_error_large。
+     **未实测，不能保证耗时**；请回传成绩与 stage_seconds。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -208,8 +227,8 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = ('race-v7.2-stable-hold-z' if USE_STABLE_PROFILE
-                else 'race-v7.2-hold-z-orbit-boost')
+PROFILE_NAME = ('race-v7.6-stable-hold-z' if USE_STABLE_PROFILE
+                else 'race-v7.6-hold-z-turn-authority')
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -234,7 +253,7 @@ TURN_SPEED_BOOST = 1.20
 CRUISE_SPEED = (540.0 if USE_STABLE_PROFILE else 560.0) * SPEED_GAIN
 # 转弯档上限同步抬高，避免它比抬预算后的曲率限速更早触顶成为新瓶颈。
 TURN_SPEED = (480.0 if USE_STABLE_PROFILE else 540.0) * SPEED_GAIN * TURN_SPEED_BOOST
-GAP_SPEED_BASE = 360.0 if USE_STABLE_PROFILE else 400.0
+GAP_SPEED_BASE = 360.0 if USE_STABLE_PROFILE else 420.0
 GAP_SPEED = GAP_SPEED_BASE * SPEED_GAIN
 # 曲率限速是 sqrt(预算/曲率)，预算只乘一次的话绕圈速度只涨 sqrt(1.08)≈4%，
 # 达不到要求的 8%；因此预算按系数的平方放大。v7.2 再叠 TURN_SPEED_BOOST²。
@@ -242,19 +261,20 @@ TURN_ACCEL_BUDGET = ((1150.0 if USE_STABLE_PROFILE else 1460.0)
                      * SPEED_GAIN ** 2 * TURN_SPEED_BOOST ** 2)
 THRUST_BASE = 48.0 if USE_STABLE_PROFILE else 50.0
 # 手册：尾摆频率与动力成正比，尾摆是主要推进方式；这里是主要提速手段。
-TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN
+# v7.6：频率再抬 5%（3.8→4.0），把推进继续压到频率上，少依赖幅值。
+TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 4.0) * SPEED_GAIN
 # 绕圈尾摆频率：手册指出频率与动力成正比，是绕圈转向的真正推进杠杆。
-TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN * TURN_SPEED_BOOST
+TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN * TURN_SPEED_BOOST
 # 尾摆幅值（同样是推进量）；窄缝内仍收窄，避免摆动导致反复纠偏。
 TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
-# 绕圈幅值只小幅 +10%：tail = correction + amplitude*sin(phase) 会被
-# (MAX_TAIL-|correction|) 裁剪，实测绕圈时该余量不足的帧占 34%，
-# 幅值加过头会被裁掉、反而让波形变形，故频率为主、幅值为辅。
-TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN * 1.10
+# v7.6：绕圈幅值由 18*1.10 降到 16。实测绕圈 |偏航误差| 均值 25°，
+# 幅值与转向抢 (MAX_TAIL-|correction|) 的余量；幅值收窄可减少锯齿航迹，
+# 推进损失由 TAIL_TURN_HZ 上调补回（频率与动力成正比）。
+TAIL_AMPLITUDE_TURN = 16.0 * SPEED_GAIN
 GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
 # 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
 GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
-GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
+GAP_LANE_FLOOR = 280.0 * SPEED_GAIN
 # 绕圈偏离圆周后重新贴回的推力上限（安全限幅，只按系数微调）。
 # v7.2 必须同步抬高：实测绕圈有 45%/38% 的帧偏出圆周 >40mm，
 # 一偏出就被钳到这个低值，把绕圈提速的收益直接抵消。
@@ -269,11 +289,22 @@ ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN * TURN_SPEED_BOOST
 ORBIT_RADIAL_DAMP = 0.22          # 径向速度阻尼：mm/s -> 等效半径误差 mm
 ORBIT_RECAPTURE_BAND = 70.0       # 漂移恶化时才介入的阈值
 ORBIT_RECAPTURE_HARD_BAND = 80.0  # 无论收敛与否，严重偏离一律回收
-# 切向 + 径向误差反馈里，径向项的增益（原为常数 2.0）。
-# 实测平均半径 236mm（计划 200mm），跑宽 18%，里程白多 4~21%。
-# 1.4 倍后指向圆周更积极，把实际半径拉回计划值附近——
-# 这既省里程（提速效果更实），也顺带让半径回收保护少触发（推力不被钳）。
-ORBIT_RADIAL_GAIN = 2.8
+# 切向 + 径向误差反馈里，径向项的增益。
+# v7.6：2.8→3.2。离线仿真（半径/偏航与实测对齐）显示在现有转向带宽下
+# 提高该增益能把平均半径从 240 拉回 223，单圈时间改善约 4%；
+# 且 v7.5 已加上径向速度阻尼，不会再单靠比例项硬掰。
+ORBIT_RADIAL_GAIN = 3.2
+# v7.6：左右胸鳍差动补转向。尾摆在大偏航误差时被振幅抢预算，
+# 用推力差补上偏航力矩，转向不再只靠一根尾巴。
+# 符号依据 UE 约定（正偏航 = 鱼头向 +Y 转）：
+#   左胸鳍（鱼体 -Y 侧）前向力对 Z 轴力矩为正，增大偏航；
+#   故正 correction（要增大偏航）时 左加右减。
+YAW_DIFF_GAIN = 0.30              # 每度 correction 对应的推力差（单侧）
+YAW_DIFF_MAX = 16.0               # 单侧差动推力上限（仍远低于 MAX_THRUST）
+# 大偏航误差时优先转向：收窄振幅、抬高频率，把尾巴让给转向。
+STEER_PRIORITY_ERROR = 22.0       # 超过该偏航误差（度）就进入转向优先
+STEER_PRIORITY_AMPLITUDE_SCALE = 0.45
+STEER_PRIORITY_FREQ_SCALE = 1.12
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # v7.4：绕第三柱改用「绕第一柱同款」的入圈方法（用户要求）。
@@ -829,8 +860,10 @@ class RaceController:
                 # 不因摆尾瞬时越过14度就从400跳到280；按预测横向偏移连续减速。
                 lateral_risk = max(abs(y), abs(y+0.18*self.velocity_y))
                 # 减速斜率与整体提速同比例放大，否则提速后偏移惩罚相对变松。
+                # v7.6：斜率 10→14，保证 y=30mm 时仍压到 GAP_ALIGN_SPEED 以下
+                # （GAP_SPEED 抬到 420 后旧斜率不够）。
                 lane_speed = GAP_SPEED-SPEED_GAIN*(
-                    10.0*max(0.0, lateral_risk-18.0)+4.0*max(0.0, abs(error)-22.0))
+                    14.0*max(0.0, lateral_risk-18.0)+4.0*max(0.0, abs(error)-22.0))
                 target_speed = min(target_speed,
                                    _constrain(lane_speed, GAP_LANE_FLOOR, GAP_SPEED))
         self.target_speed = target_speed
@@ -864,6 +897,13 @@ class RaceController:
         amplitude = TAIL_AMPLITUDE_TURN if turning else TAIL_AMPLITUDE_STRAIGHT
         if not USE_STABLE_PROFILE and self.stage == 'slalom_2' and abs(x) < 240.0:
             amplitude = GAP_TAIL_AMPLITUDE  # 窄缝内缩小摆尾，保留前向推力，减少左右纠偏。
+        # v7.6：大偏航误差时优先转向——收振幅、抬频率。
+        # 之前 correction 会把 (MAX_TAIL-|correction|) 吃掉，振幅只剩十几度，
+        # 推进与转向抢同一根尾巴；现在提前把振幅收掉，频率补推进，
+        # 尾角余量留给转向，径向/航向收敛更快，圆也不容易跑宽。
+        if abs(error) > STEER_PRIORITY_ERROR:
+            amplitude = min(amplitude, max(5.0, amplitude * STEER_PRIORITY_AMPLITUDE_SCALE))
+            frequency *= STEER_PRIORITY_FREQ_SCALE
         return thrust, frequency, amplitude
 
     def calculate(self, fish_info, now=None):
@@ -960,23 +1000,32 @@ class RaceController:
         self.phase = (self.phase + 2.0*math.pi*frequency*dt) % (2.0*math.pi)
         tail = correction + amplitude*math.sin(self.phase)
 
+        # v7.6：左右胸鳍差动补转向。UE 正偏航 = 鱼头向 +Y；
+        # 左胸鳍（鱼体 -Y 侧）前向力对 Z 力矩为正，故正 correction 时左加右减。
+        # 差动只跟偏航误差走，不拿去调滚转/俯仰（那些仍由翼角完成）。
+        yaw_assist = _constrain(YAW_DIFF_GAIN * correction, -YAW_DIFF_MAX, YAW_DIFF_MAX)
+        thrust_left = _constrain(thrust + yaw_assist, -MAX_THRUST, MAX_THRUST)
+        thrust_right = _constrain(thrust - yaw_assist, -MAX_THRUST, MAX_THRUST)
+
         left_angle, right_angle = self.depth.calculate(
             z, self.vertical_speed, pitch, roll, self.speed, dt)
         # 姿态失稳时暂时降低推进和摆尾，不把高前向推力变成向水面的推力。
         # 保留少量胸鳍推力产生恢复力矩；不要把所有控制直接归零。
         if abs(pitch) > 25.0 or abs(roll) > 40.0:
-            thrust = min(thrust, 28.0)
+            thrust_left = thrust_right = min(thrust, 28.0)
             tail = _constrain(correction, -25.0, 25.0)
         if abs(pitch) > 45.0 or abs(roll) > 65.0:
-            thrust = min(thrust, 16.0)
+            thrust_left = thrust_right = min(thrust, 16.0)
             tail = 0.0
             self.pid.reset()
         if abs(pitch) > 70.0:
-            thrust = min(thrust, 8.0)
+            thrust_left = min(thrust_left, 8.0)
+            thrust_right = min(thrust_right, 8.0)
         if z > 1150.0 and self.vertical_speed > 20.0:
-            thrust = min(thrust, 22.0)
+            thrust_left = min(thrust_left, 22.0)
+            thrust_right = min(thrust_right, 22.0)
         # 滚转用胸鳍角度差恢复；前向推力差主要产生偏航，不再拿它调滚转。
-        self.command = Command(tail, thrust, thrust, left_angle, right_angle)
+        self.command = Command(tail, thrust_left, thrust_right, left_angle, right_angle)
         return self.command
 
 
@@ -1539,13 +1588,51 @@ def self_test():
             self.assertAlmostEqual(left, right)
 
         def test_roll_correction_uses_angle_not_horizontal_force(self):
+            diffs = []
             for roll in (-20.0, 20.0):
                 c = RaceController()
                 command = c.calculate(info(z=HOLD_Z, roll=roll), now=1.0)
-                self.assertAlmostEqual(command.left, command.right)
                 left_z = DepthController.vertical_component(command.left_angle, roll=roll)
                 right_z = DepthController.vertical_component(command.right_angle, roll=roll)
                 self.assertGreater((right_z-left_z)*roll, 0.0)
+                diffs.append(command.left - command.right)
+            # 滚转不得改变推力差：差动只服务偏航，滚转仍由翼角完成。
+            self.assertAlmostEqual(diffs[0], diffs[1], places=6)
+
+        def test_yaw_differential_assists_turning(self):
+            """v7.6：正偏航误差时左加右减（UE 正偏航 = 鱼头向 +Y）。"""
+            self.assertGreater(YAW_DIFF_GAIN, 0.0)
+            self.assertGreater(YAW_DIFF_MAX, 0.0)
+            self.assertLessEqual(YAW_DIFF_MAX, MAX_THRUST)
+
+            def pair(thrust, correction):
+                assist = _constrain(YAW_DIFF_GAIN * correction, -YAW_DIFF_MAX, YAW_DIFF_MAX)
+                return (_constrain(thrust + assist, -MAX_THRUST, MAX_THRUST),
+                        _constrain(thrust - assist, -MAX_THRUST, MAX_THRUST))
+
+            left, right = pair(50.0, 30.0)
+            self.assertGreater(left, right)
+            left, right = pair(50.0, -30.0)
+            self.assertLess(left, right)
+            left, right = pair(50.0, 200.0)
+            self.assertLessEqual(abs(left), MAX_THRUST)
+            self.assertLessEqual(abs(right), MAX_THRUST)
+            c = RaceController()
+            command = c.calculate(info(x=-1250.0, y=0.0, yaw=0.0), now=1.0)
+            self.assertLessEqual(abs(command.left - command.right), 2.0 * YAW_DIFF_MAX + 1e-6)
+
+        def test_steering_priority_reduces_amplitude_when_error_large(self):
+            """v7.6：大偏航误差时收振幅、抬频率，把尾巴让给转向。"""
+            self.assertGreater(STEER_PRIORITY_ERROR, 0.0)
+            self.assertLess(STEER_PRIORITY_AMPLITUDE_SCALE, 1.0)
+            self.assertGreater(STEER_PRIORITY_FREQ_SCALE, 1.0)
+            c = RaceController()
+            c.speed = 360.0
+            small = c._motion_profile(1.0 / LOOP_R, 5.0, OBS1[0], -LOOP_R)
+            large = c._motion_profile(1.0 / LOOP_R, 35.0, OBS1[0], -LOOP_R)
+            # frequency/amplitude 元组位置: (thrust, frequency, amplitude)
+            self.assertGreater(large[1], small[1])
+            self.assertLess(large[2], small[2])
 
         def test_vertical_attitude_keeps_recovery_control(self):
             for pitch in (-90.0, 90.0):
@@ -1605,6 +1692,24 @@ def self_test():
         raise SystemExit(1)
 
 
+TELEMETRY_FIELDS = (
+    'Time(s)', 'Stage', 'PosX', 'PosY', 'PosZ', 'Pitch(deg)', 'Roll(deg)',
+    'Speed', 'TargetSpeed', 'VerticalSpeed', 'YawError', 'RefVz', 'DesiredPitch',
+    'DepthIntegral', 'PitchTrim', 'Tail', 'ThrustL', 'ThrustR', 'WingLeft', 'WingRight')
+
+
+def write_telemetry(path, rows):
+    """把整场遥测一次性落盘；不在 60Hz 回调里做 IO。"""
+    import csv
+    try:
+        with open(path, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(TELEMETRY_FIELDS)
+            writer.writerows(rows)
+    except OSError as exc:
+        print('[race] telemetry write failed: {}'.format(exc), flush=True)
+
+
 def main():
     # 允许平台加载根目录的 test.py；不要求把嵌入式Python写入全局PATH。
     sys.dont_write_bytecode = True
@@ -1619,6 +1724,9 @@ def main():
     last_received = [None]
     last_report = [0.0]
     debug = '--debug' in sys.argv
+    telemetry_rows = []
+    telemetry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'race_telemetry.csv')
 
     def publish(command):
         message = mycue.FishCtrlInfo()
@@ -1646,6 +1754,24 @@ def main():
                 print('[error] {}: {}'.format(type(exc).__name__, exc), flush=True)
                 command = controller.stop('callback_error')
             publish(command)
+            if not controller.finished and controller.started_at is not None:
+                elapsed = now - controller.started_at
+                telemetry_rows.append((
+                    '{:.3f}'.format(elapsed), controller.stage,
+                    '{:.3f}'.format(fish_info.pos.x), '{:.3f}'.format(fish_info.pos.y),
+                    '{:.3f}'.format(fish_info.pos.z),
+                    '{:.3f}'.format(controller.pitch_degrees),
+                    '{:.3f}'.format(fish_info.rot.x),
+                    '{:.3f}'.format(controller.speed), '{:.3f}'.format(controller.target_speed),
+                    '{:.3f}'.format(controller.vertical_speed),
+                    '{:.3f}'.format(controller.heading_error),
+                    '{:.3f}'.format(controller.depth.reference_vz),
+                    '{:.3f}'.format(controller.depth.desired_pitch),
+                    '{:.3f}'.format(controller.depth.integral),
+                    '{:.3f}'.format(controller.depth.pitch_trim),
+                    '{:.3f}'.format(command.tail),
+                    '{:.3f}'.format(command.left), '{:.3f}'.format(command.right),
+                    '{:.3f}'.format(command.left_angle), '{:.3f}'.format(command.right_angle)))
             if stage_before != controller.stage or (debug and now-last_report[0] >= 1.0):
                 elapsed = 0.0 if controller.started_at is None else now-controller.started_at
                 print('[race] {:.2f}s stage={} pos={} speed={:.1f}/{:.1f} yaw_error={:.1f} slip={:.1f} z_target={:.0f} vz={:.1f} pitch={:.1f}/{:.1f} wings=({:.1f},{:.1f}) laps={} stage_seconds={}'.format(
@@ -1682,6 +1808,10 @@ def main():
         # 保留subscriber引用直到退出；不要在DDS回调线程内销毁reader。
         with lock:
             publish(Command())
+            if telemetry_rows:
+                write_telemetry(telemetry_path, telemetry_rows)
+                print('[race] telemetry -> {} ({} frames)'.format(
+                    telemetry_path, len(telemetry_rows)), flush=True)
         subscriber.close()
 
 
