@@ -166,6 +166,11 @@ v7.6：针对"速度一直卡在 20 秒附近"做**转向权限**提速，不再
      对应自测 test_yaw_differential_assists_turning /
      test_steering_priority_reduces_amplitude_when_error_large。
      **未实测，不能保证耗时**；请回传成绩与 stage_seconds。
+     【v7.6.1 实测回退修正】首版实测 22.01s，比 20s 档更慢，遥测（1320 帧）：
+       orbit_1 角速度 70.1→60.3 deg/s、|偏航误差| 24.8→37.7°、半径 230→252，
+       绕圈 |推力差| 高达 20/32 —— **差动符号反了**，推力差在和尾巴抢转向，
+       越纠偏越偏。现改为右加左减（实测证据优先于坐标系推断），
+       差动上限 16→12，转向优先收幅 0.45→0.60，径向增益退回 2.8。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -290,20 +295,20 @@ ORBIT_RADIAL_DAMP = 0.22          # 径向速度阻尼：mm/s -> 等效半径误
 ORBIT_RECAPTURE_BAND = 70.0       # 漂移恶化时才介入的阈值
 ORBIT_RECAPTURE_HARD_BAND = 80.0  # 无论收敛与否，严重偏离一律回收
 # 切向 + 径向误差反馈里，径向项的增益。
-# v7.6：2.8→3.2。离线仿真（半径/偏航与实测对齐）显示在现有转向带宽下
-# 提高该增益能把平均半径从 240 拉回 223，单圈时间改善约 4%；
-# 且 v7.5 已加上径向速度阻尼，不会再单靠比例项硬掰。
-ORBIT_RADIAL_GAIN = 3.2
+# v7.6.1：保持 2.8。首版曾试 3.2，但与错误差动叠加后圆反而跑更大（252），
+# 一并退回；等差动符号验证有效后再单独试更高增益。
+ORBIT_RADIAL_GAIN = 2.8
 # v7.6：左右胸鳍差动补转向。尾摆在大偏航误差时被振幅抢预算，
 # 用推力差补上偏航力矩，转向不再只靠一根尾巴。
-# 符号依据 UE 约定（正偏航 = 鱼头向 +Y 转）：
-#   左胸鳍（鱼体 -Y 侧）前向力对 Z 轴力矩为正，增大偏航；
-#   故正 correction（要增大偏航）时 左加右减。
+# v7.6.1：符号经实测证伪后翻转。首版按 UE 坐标系推断「正 correction 左加右减」，
+# 实测 22.01s 回退：绕圈 |偏航误差| 25→38°、角速度 70→60，推力差与尾舵反向。
+# 现按实测证据改为 **右加左减**（正 correction 时右侧胸鳍更多）。
 YAW_DIFF_GAIN = 0.30              # 每度 correction 对应的推力差（单侧）
-YAW_DIFF_MAX = 16.0               # 单侧差动推力上限（仍远低于 MAX_THRUST）
+YAW_DIFF_MAX = 12.0               # 单侧差动推力上限（仍远低于 MAX_THRUST）
 # 大偏航误差时优先转向：收窄振幅、抬高频率，把尾巴让给转向。
+# v7.6.1：收幅 0.45→0.60，避免大误差时推进掉太快。
 STEER_PRIORITY_ERROR = 22.0       # 超过该偏航误差（度）就进入转向优先
-STEER_PRIORITY_AMPLITUDE_SCALE = 0.45
+STEER_PRIORITY_AMPLITUDE_SCALE = 0.60
 STEER_PRIORITY_FREQ_SCALE = 1.12
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
@@ -1000,12 +1005,11 @@ class RaceController:
         self.phase = (self.phase + 2.0*math.pi*frequency*dt) % (2.0*math.pi)
         tail = correction + amplitude*math.sin(self.phase)
 
-        # v7.6：左右胸鳍差动补转向。UE 正偏航 = 鱼头向 +Y；
-        # 左胸鳍（鱼体 -Y 侧）前向力对 Z 力矩为正，故正 correction 时左加右减。
+        # v7.6.1：差动符号按实测翻转为右加左减（首版左加右减导致 22.01s 回退）。
         # 差动只跟偏航误差走，不拿去调滚转/俯仰（那些仍由翼角完成）。
         yaw_assist = _constrain(YAW_DIFF_GAIN * correction, -YAW_DIFF_MAX, YAW_DIFF_MAX)
-        thrust_left = _constrain(thrust + yaw_assist, -MAX_THRUST, MAX_THRUST)
-        thrust_right = _constrain(thrust - yaw_assist, -MAX_THRUST, MAX_THRUST)
+        thrust_left = _constrain(thrust - yaw_assist, -MAX_THRUST, MAX_THRUST)
+        thrust_right = _constrain(thrust + yaw_assist, -MAX_THRUST, MAX_THRUST)
 
         left_angle, right_angle = self.depth.calculate(
             z, self.vertical_speed, pitch, roll, self.speed, dt)
@@ -1600,20 +1604,20 @@ def self_test():
             self.assertAlmostEqual(diffs[0], diffs[1], places=6)
 
         def test_yaw_differential_assists_turning(self):
-            """v7.6：正偏航误差时左加右减（UE 正偏航 = 鱼头向 +Y）。"""
+            """v7.6.1：正偏航误差时右加左减（实测证伪首版左加右减）。"""
             self.assertGreater(YAW_DIFF_GAIN, 0.0)
             self.assertGreater(YAW_DIFF_MAX, 0.0)
             self.assertLessEqual(YAW_DIFF_MAX, MAX_THRUST)
 
             def pair(thrust, correction):
                 assist = _constrain(YAW_DIFF_GAIN * correction, -YAW_DIFF_MAX, YAW_DIFF_MAX)
-                return (_constrain(thrust + assist, -MAX_THRUST, MAX_THRUST),
-                        _constrain(thrust - assist, -MAX_THRUST, MAX_THRUST))
+                return (_constrain(thrust - assist, -MAX_THRUST, MAX_THRUST),
+                        _constrain(thrust + assist, -MAX_THRUST, MAX_THRUST))
 
             left, right = pair(50.0, 30.0)
-            self.assertGreater(left, right)
+            self.assertGreater(right, left)
             left, right = pair(50.0, -30.0)
-            self.assertLess(left, right)
+            self.assertGreater(left, right)
             left, right = pair(50.0, 200.0)
             self.assertLessEqual(abs(left), MAX_THRUST)
             self.assertLessEqual(abs(right), MAX_THRUST)
