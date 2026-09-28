@@ -171,6 +171,13 @@ v7.6：针对"速度一直卡在 20 秒附近"做**转向权限**提速，不再
        绕圈 |推力差| 高达 20/32 —— **差动符号反了**，推力差在和尾巴抢转向，
        越纠偏越偏。现改为右加左减（实测证据优先于坐标系推断），
        差动上限 16→12，转向优先收幅 0.45→0.60，径向增益退回 2.8。
+     【v7.6.2 实测结论】翻转后 5 次 19.78~22.06s，仍未低于 20s 档。
+       遥测显示符号已正确（corr(yaw_err, L-R)=-0.93），但绕圈角速度只回到
+       64.6 deg/s（v7.5 是 70.1）、半径 241/251 仍偏大、|偏航误差| 33~36°。
+       结论：**胸鳍推力差在这个平台上换不来有效偏航力矩**，只能白白分走
+       前向推力。现关闭差动，改走「大偏航误差时降前向推力」——
+       少往前冲、让尾巴把圆收回来（时间 = 2πr/v，半径收窄比保持冲刺更划算），
+       同时把绕圈振幅再收、频率再抬，减少锯齿把圆跑宽。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
@@ -269,13 +276,12 @@ THRUST_BASE = 48.0 if USE_STABLE_PROFILE else 50.0
 # v7.6：频率再抬 5%（3.8→4.0），把推进继续压到频率上，少依赖幅值。
 TAIL_STRAIGHT_HZ = (3.4 if USE_STABLE_PROFILE else 4.0) * SPEED_GAIN
 # 绕圈尾摆频率：手册指出频率与动力成正比，是绕圈转向的真正推进杠杆。
-TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.8) * SPEED_GAIN * TURN_SPEED_BOOST
+TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 4.2) * SPEED_GAIN * TURN_SPEED_BOOST
 # 尾摆幅值（同样是推进量）；窄缝内仍收窄，避免摆动导致反复纠偏。
 TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
-# v7.6：绕圈幅值由 18*1.10 降到 16。实测绕圈 |偏航误差| 均值 25°，
-# 幅值与转向抢 (MAX_TAIL-|correction|) 的余量；幅值收窄可减少锯齿航迹，
-# 推进损失由 TAIL_TURN_HZ 上调补回（频率与动力成正比）。
-TAIL_AMPLITUDE_TURN = 16.0 * SPEED_GAIN
+# v7.6.2：绕圈幅值 16→12。实测绕圈 |偏航误差| 仍 33°+，大振幅锯齿把圆跑宽；
+# 频率已抬到 4.2Hz，推进主要靠频率。
+TAIL_AMPLITUDE_TURN = 12.0 * SPEED_GAIN
 GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
 # 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
 GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
@@ -298,18 +304,21 @@ ORBIT_RECAPTURE_HARD_BAND = 80.0  # 无论收敛与否，严重偏离一律回�
 # v7.6.1：保持 2.8。首版曾试 3.2，但与错误差动叠加后圆反而跑更大（252），
 # 一并退回；等差动符号验证有效后再单独试更高增益。
 ORBIT_RADIAL_GAIN = 2.8
-# v7.6：左右胸鳍差动补转向。尾摆在大偏航误差时被振幅抢预算，
-# 用推力差补上偏航力矩，转向不再只靠一根尾巴。
-# v7.6.1：符号经实测证伪后翻转。首版按 UE 坐标系推断「正 correction 左加右减」，
-# 实测 22.01s 回退：绕圈 |偏航误差| 25→38°、角速度 70→60，推力差与尾舵反向。
-# 现按实测证据改为 **右加左减**（正 correction 时右侧胸鳍更多）。
-YAW_DIFF_GAIN = 0.30              # 每度 correction 对应的推力差（单侧）
-YAW_DIFF_MAX = 12.0               # 单侧差动推力上限（仍远低于 MAX_THRUST）
+# v7.6：左右胸鳍差动补转向。
+# v7.6.1：符号翻转为右加左减。
+# v7.6.2：**彻底关闭差动**。两轮实测（错号 22.01s、翻号 19.78~22.06s）证明
+# 胸鳍推力差换不来有效偏航力矩，只分走前向推力。保留常量便于一键重开。
+YAW_DIFF_GAIN = 0.30
+YAW_DIFF_MAX = 0.0                # 0 = 关闭差动；若要重开试 8~12
 # 大偏航误差时优先转向：收窄振幅、抬高频率，把尾巴让给转向。
-# v7.6.1：收幅 0.45→0.60，避免大误差时推进掉太快。
 STEER_PRIORITY_ERROR = 22.0       # 超过该偏航误差（度）就进入转向优先
 STEER_PRIORITY_AMPLITUDE_SCALE = 0.60
 STEER_PRIORITY_FREQ_SCALE = 1.12
+# v7.6.2：大偏航误差时降低前向推力。少冲一点，让尾巴把半径收回来。
+# 时间 = 2πr/v，把 r 从 240 拉回 210 的收益大于短时降速。
+STEER_SLOW_ERROR = 28.0           # 超过该偏航误差开始降推力
+STEER_SLOW_SPAN = 55.0            # 再大这么多度时降到下限
+STEER_SLOW_FLOOR = 0.20           # 推力相对 MAX_THRUST 的下限（严重偏航仍保留恢复力）
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # v7.4：绕第三柱改用「绕第一柱同款」的入圈方法（用户要求）。
@@ -877,9 +886,11 @@ class RaceController:
                             18.0, MAX_THRUST)
 
         # 原版在40°处从50骤降到24，摆尾导致误差跨阈值时会反复急减速。
-        # 现在35°后连续减推力，严重偏航仍限制到10；并非取消转弯保护。
+        # v7.6.2：大偏航误差时更积极地降前向推力——少冲一点，让尾巴把圆收回来。
+        # 时间 = 2πr/v，半径从 240 收到 210 的收益大于短时降速。
         steering_cap = MAX_THRUST * _constrain(
-            1.0-max(0.0, abs(error)-35.0)/90.0, 0.20, 1.0)
+            1.0-max(0.0, abs(error)-STEER_SLOW_ERROR)/STEER_SLOW_SPAN,
+            STEER_SLOW_FLOOR, 1.0)
         thrust = min(thrust, steering_cap)
         if self.orbit is not None:
             cx, cy = self.orbit.center
@@ -994,10 +1005,13 @@ class RaceController:
         error = math.degrees(_wrap(desired-yaw))
         self.heading_error = error
         # 弯道前馈只辅助转向，不用时间推算绕圈是否完成。
-        feedforward = 0.15 * math.degrees(self.speed*signed_curvature)
+        # v7.6.2：0.15→0.22。实测 PID 常年顶在 ±62 钳位，前馈给足稳态转向量，
+        # 让 PID 只补残差，减少饱和导致的「转不过来 → 半径跑宽」。
+        feedforward = 0.22 * math.degrees(self.speed*signed_curvature)
         if not USE_STABLE_PROFILE:
-            feedforward = _constrain(feedforward, -30.0, 30.0)
-        correction = _constrain(self.pid.calculate(error, dt)+feedforward, -62.0, 62.0)
+            feedforward = _constrain(feedforward, -36.0, 36.0)
+        # 尾舵修正上限 62→72：留给振幅仍有 8°，但稳态转向权限更大。
+        correction = _constrain(self.pid.calculate(error, dt)+feedforward, -72.0, 72.0)
 
         thrust, frequency, amplitude = self._motion_profile(curvature, error, x, y)
         # 先为转向预留尾角空间，避免单侧裁剪正弦波改变平均转向量。
@@ -1604,26 +1618,28 @@ def self_test():
             self.assertAlmostEqual(diffs[0], diffs[1], places=6)
 
         def test_yaw_differential_assists_turning(self):
-            """v7.6.1：正偏航误差时右加左减（实测证伪首版左加右减）。"""
-            self.assertGreater(YAW_DIFF_GAIN, 0.0)
-            self.assertGreater(YAW_DIFF_MAX, 0.0)
+            """v7.6.2：差动可关闭（YAW_DIFF_MAX=0）；若开启必须是右加左减。"""
+            self.assertGreaterEqual(YAW_DIFF_MAX, 0.0)
             self.assertLessEqual(YAW_DIFF_MAX, MAX_THRUST)
+            self.assertGreaterEqual(YAW_DIFF_GAIN, 0.0)
 
-            def pair(thrust, correction):
-                assist = _constrain(YAW_DIFF_GAIN * correction, -YAW_DIFF_MAX, YAW_DIFF_MAX)
+            def pair(thrust, correction, limit=None):
+                cap = YAW_DIFF_MAX if limit is None else limit
+                assist = _constrain(YAW_DIFF_GAIN * correction, -cap, cap)
                 return (_constrain(thrust - assist, -MAX_THRUST, MAX_THRUST),
                         _constrain(thrust + assist, -MAX_THRUST, MAX_THRUST))
 
-            left, right = pair(50.0, 30.0)
-            self.assertGreater(right, left)
-            left, right = pair(50.0, -30.0)
-            self.assertGreater(left, right)
-            left, right = pair(50.0, 200.0)
-            self.assertLessEqual(abs(left), MAX_THRUST)
-            self.assertLessEqual(abs(right), MAX_THRUST)
             c = RaceController()
             command = c.calculate(info(x=-1250.0, y=0.0, yaw=0.0), now=1.0)
             self.assertLessEqual(abs(command.left - command.right), 2.0 * YAW_DIFF_MAX + 1e-6)
+            # 开启时的方向约定：正 correction 右推力更大（实测证伪过左加右减）
+            left, right = pair(50.0, 30.0, limit=12.0)
+            self.assertGreater(right, left)
+            left, right = pair(50.0, -30.0, limit=12.0)
+            self.assertGreater(left, right)
+            left, right = pair(50.0, 200.0, limit=12.0)
+            self.assertLessEqual(abs(left), MAX_THRUST)
+            self.assertLessEqual(abs(right), MAX_THRUST)
 
         def test_steering_priority_reduces_amplitude_when_error_large(self):
             """v7.6：大偏航误差时收振幅、抬频率，把尾巴让给转向。"""
