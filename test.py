@@ -71,6 +71,34 @@ v8：绕圈段的"尾摆被 DC 挤死"专项（依据取自自测附带的 on-ca
   想只看摆幅那一半：把 TAIL_GAIN 改回 1.0（优先级对调仍保留）。
   实测由用户执行；未实测，不能保证耗时。
 
+v9：绕圈半径回路稳定化 + 主动防撞 + 可选逐帧遥测（用户反馈"绕第三柱不稳，
+    要么撞到要么高度一直变化"）。
+  取证（对 race_telemetry.csv 做最小二乘圆拟合 + 半径分布统计）：
+    ① **不是圆心偏了，是圆太大且来回摆**。orbit_1/orbit_3 的拟合圆心只偏
+       (-5.9,+5.0) / (+11.6,-3.9) mm，但拟合半径 225.9 / 229.8（指令 200），
+       半径 std 24.8 / 32.8，p05~p95 跨度 72 / 122mm（orbit_3 实测 174.9~318.8）。
+       径向振荡周期实测 1.22s（0.82Hz）——一条**欠阻尼的径向回路**。
+    ② 高度那一路其实已经在工作：orbit_1 的 z 标准差 0.4mm、orbit_3 是 5.2mm
+       （用户看到的"高度一直变化"是 orbit_3 的 ±7mm 慢漂，不是 v7.2 时代
+       那种 ±67mm 极限环——那版是把积分权限提到 30 造成的，v7 已回退）。
+       orbit_3 的残余是"小积分权限 + 转两圈时长"造成的慢漂，不构成失控。
+    ③ 因为 ① 是"圆太大"，"往下压半径指令"这条路**几乎已经用尽**：
+       柱半对角 141.4 + 鱼等效半宽 45 = 186.4 是安全下限，指令半径 200
+       只剩 13.6mm 余量。压到 175（参考文献的 bias=-25）等于**指挥鱼进柱角**。
+  据此改三处：
+    · 径向阻尼 ORBIT_RADIAL_DAMP=0.20s：把纯 P 的径向回路改成 PD，
+      压掉 1.22s 的半径振荡（v7 只有比例项，所以回路没有阻尼）。
+    · 内切地板 ORBIT_R_FLOOR=192：半径掉到 192 以下就主动往外推。
+      实测最小半径 178.2 / 174.9，所以这条**会被触发**，正是防撞要的场景。
+    · 深度抗积分饱和：俯仰配平顶到同号上限时停止积分，减少过冲；
+      高度契约不变（目标高度上 integral/ref_vz/pitch 仍恒为 0）。
+    · 新增 `--telemetry`（默认关闭）：逐帧落盘 race_telemetry.csv，
+      多写 OrbitRadius/RadialSpeed/EffRadiusError/FloorActive 四列，便于复核。
+  明确不改：MAX_THRUST / MAX_TAIL / 安全间隙 55 / 圈数判定 / 路径几何 / HOLD_Z。
+  ORBIT_RADIUS_BIAS 默认 0.0（先只做阻尼）；确认振荡压下去后可逐步试 -5 / -10。
+  --stable 档不做绕圈改动（曲线最短、位置最准，保持与 v7 一致）。
+  实测由用户执行；未实测，不能保证耗时。
+
 命令行加 --stable 可使用v2平面路线/速度参数；平台不方便传参时，
 将下方 USE_STABLE_PROFILE 改为 True。两种模式都使用修正后的高度控制，
 不恢复旧版的向上推力错误。两种模式都保留全部圈数和限幅。
@@ -175,6 +203,46 @@ ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
 # v8：严重外漂的安全底线。向外漂到这一档就不只是"漂宽"，而是失控了，
 #   无论方向一律收推力（实测该段最大外漂 118.8mm）。
 ORBIT_RECAPTURE_HARD_BAND = 110.0
+# ===================== v9：绕圈半径回路稳定化（用户反馈 orbit_3 不稳）=====================
+# 用户反馈："绕第三个障碍物状态不稳定，要么撞到要么高度一直变化。"
+# 对 race_telemetry.csv 做最小二乘圆拟合 + 半径分布统计，结论如下：
+#
+# (1) 不是"圆心偏了"，而是"圆太大且来回摆"。orbit_1/orbit_3 的拟合圆心
+#     只偏 (-5.9,+5.0) / (+11.6,-3.9) mm，但拟合半径 225.9 / 229.8（指令 200），
+#     半径 std 24.8 / 32.8，p05~p95 跨度 72 / 122mm（orbit_3 实测 174.9~318.8）。
+#     径向振荡周期实测 1.22s（0.82Hz）——这是一条**欠阻尼的径向回路**。
+# (2) 因此"往下压半径指令"这条路**几乎已经用尽**：柱子半对角 141.4 + 鱼等效
+#     半宽 45 = 186.4 是安全下限，指令半径 200 只剩 13.6mm 余量。
+#     把指令半径压到 175（即参考文献的 bias=-25）会让鱼被指挥进柱子角里——
+#     正是要避免的"撞到"。所以本版**不采用大内偏置**，只保留一个小幅可调旋钮。
+# (3) 真正能做的是把 ±40mm 的振荡压下去：振荡小了，均值才敢往 186.4 靠，
+#     同时也把"偶发贴柱->撞击"的概率压掉（orbit_3 的 max|残差| 达 77.6mm）。
+
+# 径向阻尼：把"径向速度"折算成等效半径提前量，把纯 P 的径向回路改成 PD。
+#   单位是秒，含义是"按多少秒后的径向位置来提前修正"（对径向速度的预测时间）。
+#   取值依据：实测径向振荡周期 1.22s（ω≈5.15rad/s）。这个提前量的相位收益是
+#   atan(T·ω)，但**径向速度估计本身是一阶滤波**（见 calculate 里
+#   alpha = dt/(0.08+dt)，时间常数≈0.08s），会带来 atan(0.08ω)≈22° 的相位滞后。
+#   净相位领先 ≈ atan(T·ω) - atan(0.08·ω)。
+#     T=0.10 -> 27-22 = +5°   （几乎被滤波滞后吃掉，作用有限）
+#     T=0.20 -> 46-22 = +24°  （明显有效，且远离正反馈）
+#     T=0.30 -> 57-22 = +35°  （更硬，可试）
+#   上限：T 再大就趋近"按 LOOP_R/v ≈ 0.73s 提前"，那已接近正反馈，不要越。
+ORBIT_RADIAL_DAMP = 0.20
+# 绕圈半径指令偏置（mm，负值=向内收）。**安全可用区间约 [-10, +30]**：
+#   下限由几何决定（指令半径 ≥ 186.4 才不把鱼指挥进柱角），上限是浪费里程。
+#   默认 0.0 表示"先不动半径指令，只做阻尼"；确认振荡被压下去之后，
+#   可以逐步试 -5 / -10。不要一次给到 -25。
+ORBIT_RADIUS_BIAS = 0.0
+# 内切地板（主动防撞）：半径掉到这一档就主动往外推，专治"贴柱/撞柱"。
+#   几何依据：柱半对角 141.4 + 鱼等效半宽 45 = 186.4 是绝对安全下限；
+#   地板取 192.0（= 186.4 + 5.6mm 余量）。实测 orbit_1/orbit_3 的最小半径
+#   分别是 178.2 / 174.9 —— 也就是说**这条地板在实测里会被触发**，正是需要它的场景。
+#   机制参照参考文献的"内切地板"（ARC_R_FLOOR）：半径低于地板时，把等效半径误差
+#   额外抬一个 (地板 - 半径) 的正值，于是航向立刻朝外修正。只在"快要进柱角"时生效，
+#   正常绕行（实测 p05≈185~191）基本不触发，因此不会自己造出新的极限环。
+ORBIT_R_FLOOR = 192.0
+ORBIT_FLOOR_PUSH = 1.6
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -441,6 +509,40 @@ def _wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+# ===================== v9：逐帧遥测（--telemetry，默认关闭）=====================
+TELEMETRY_HEADER = (
+    'Time(s),Stage,PosX,PosY,PosZ,Pitch(deg),Roll(deg),Speed,'
+    'VerticalSpeed,YawError,DepthIntegral,PitchTrim,Tail,ThrustL,'
+    'ThrustR,WingLeft,WingRight,OrbitRadius,RadialSpeed,'
+    'EffRadiusError,FloorActive\n')
+TELEMETRY_FIELDS = TELEMETRY_HEADER.count(',')      # 列数-1
+
+
+def telemetry_row(controller, command, now):
+    """把一帧状态格式化成 CSV 行（不含换行）。
+
+    绕圈观测量直接取 `_guidance` 里**实际用过**的那几个值，不在这里重算，
+    否则"记录值"和"实际用的值"会悄悄分叉。非绕圈段这些列为 nan。
+    """
+    o = controller.orbit
+    nan = float('nan')
+    px, py, pz = controller.last_position
+    return ('%.3f,%s,%.1f,%.1f,%.1f,%.2f,%.2f,%.1f,%.1f,%.1f,%.2f,%.1f,'
+            '%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f'
+            % (0.0 if controller.started_at is None else now-controller.started_at,
+               controller.stage, px, py, pz, controller.pitch_degrees,
+               0.0 if controller.depth.last_roll is None
+               else controller.depth.last_roll,
+               controller.speed, controller.vertical_speed,
+               controller.heading_error, controller.depth.integral,
+               controller.depth.pitch_trim, command.tail, command.left,
+               command.right, command.left_angle, command.right_angle,
+               o.radius if o is not None else nan,
+               o.radial_speed if o is not None else nan,
+               o.eff_radius_error if o is not None else nan,
+               1.0 if (o is not None and o.floor_active) else 0.0))
+
+
 class OrbitProgress:
     """仅累计真实运动产生的有符号角度；逆行会抵消，不奖励瞬移或抖动。"""
     def __init__(self, center, laps):
@@ -448,6 +550,13 @@ class OrbitProgress:
         self.required = laps * 2.0 * math.pi
         self.angle = 0.0
         self.previous = None
+        # v9：把本帧的绕圈观测量记在这里，供 --telemetry 落盘与排查使用。
+        #   由 _guidance 计算时写入，避免遥测代码重复实现一遍同一套公式
+        #   （重复实现是"记录值"和"实际用的值"悄悄分叉的常见来源）。
+        self.radius = float('nan')
+        self.radial_speed = float('nan')
+        self.eff_radius_error = float('nan')
+        self.floor_active = False
 
     def update(self, x, y):
         dx, dy = x-self.center[0], y-self.center[1]
@@ -506,7 +615,16 @@ class DepthController:
 
         height_error = HOLD_Z-z
         # 贴近锁定高度时才积累小幅偏置；大偏差和大姿态恢复时禁止积分饱和。
-        if 12.0 < abs(height_error) < 160.0 and abs(pitch) < 20.0:
+        # v9：再加一层**抗积分饱和**——俯仰配平已经顶到权限上限、而且顶的方向
+        #   恰好就是高度误差要修的方向时，继续积分不会换来任何额外权限，
+        #   只会在误差换向时留下一坨反号偏置。实测 orbit_3 的积分在 +10.7~-1.4
+        #   之间来回（p90=+10.7，已贴近 ±12 限幅），正是这种过冲的痕迹。
+        #   注意：高度误差回到死区内（|he|<=12）时本分支不生效，所以在目标
+        #   高度上仍然不产生任何垂直动作(v7 的契约不变)。
+        trim_saturated = (abs(self.pitch_trim) >= 34.5
+                          and self.pitch_trim*height_error > 0.0)
+        if (12.0 < abs(height_error) < 160.0 and abs(pitch) < 20.0
+                and not trim_saturated):
             self.integral = _constrain(self.integral+0.04*height_error*dt, -12.0, 12.0)
         else:
             self.integral *= max(0.0, 1.0-dt)
@@ -618,7 +736,28 @@ class RaceController:
                 self._next_section()
                 return self._guidance(x, y)
             dx, dy = x-section.center[0], y-section.center[1]
-            radius_error = math.hypot(dx, dy) - LOOP_R
+            radius = math.hypot(dx, dy)
+            # v9：径向阻尼 + 小幅可调半径偏置（见常量块）。取"ORBIT_RADIAL_DAMP
+            #   秒之后的半径"作提前量，把纯 P 的径向回路改成 PD，用来压掉实测
+            #   0.82Hz、±40mm 的半径振荡——正是 orbit_3 偶发贴柱/撞击的来源。
+            #   v7 只做了比例项（atan2(2*e_r, LOOP_R)），所以回路没有阻尼。
+            radial_speed = ((self.velocity_x*dx + self.velocity_y*dy) / radius
+                            if radius > 1.0 else 0.0)
+            radius_error = (radius - (LOOP_R + ORBIT_RADIUS_BIAS)
+                            + ORBIT_RADIAL_DAMP*radial_speed)
+            # 内切地板：快要贴进柱角时主动往外推（见常量块）。
+            #   方向核对：本回路的期望航向偏移是 atan2(2*e_r, LOOP_R)，
+            #   所以 e_r **越负越朝外**。要"往外推"就得把 e_r 推得更负，
+            #   即**减去**一个正值——加号会抵消本来该有的外推，方向是反的。
+            #   d>=floor 时该项恒为 0，回路与原来逐位一致，不引入新的极限环。
+            if radius < ORBIT_R_FLOOR:
+                radius_error -= ORBIT_FLOOR_PUSH*(ORBIT_R_FLOOR - radius)
+                self.orbit.floor_active = True
+            else:
+                self.orbit.floor_active = False
+            self.orbit.radius = radius
+            self.orbit.radial_speed = radial_speed
+            self.orbit.eff_radius_error = radius_error
             # 圆的切向 + 径向误差反馈，比追前瞻弦更不易切入方柱角。
             heading = math.atan2(dy, dx) + math.pi/2
             heading += math.atan2(2.0*radius_error, LOOP_R)
@@ -693,7 +832,9 @@ class RaceController:
         thrust = min(thrust, steering_cap)
         if self.orbit is not None:
             cx, cy = self.orbit.center
-            radial_error = math.hypot(x-cx, y-cy)-LOOP_R
+            # v9：这里的阈值也要跟着 ORBIT_RADIUS_BIAS 走，否则一旦把半径指令
+            #   往内收，同一套阈值就会把"正常收敛"误判成"偏离"。
+            radial_error = math.hypot(x-cx, y-cy)-(LOOP_R + ORBIT_RADIUS_BIAS)
             # v8：只对"贴柱侧"（真实向心偏差）收推力。v7 的 abs() 把向心与离心
             # 一视同仁，于是实测里**所有**回归圆弧的帧（离心侧）都被误判成偏离、
             # 把推力钳到 32.6，速度掉到 237——等于为了"回收"反而拖慢。
@@ -1144,6 +1285,116 @@ def self_test():
             self.assertAlmostEqual(orbit_amp, TAIL_AMPLITUDE_TURN*TAIL_GAIN, places=6)
             self.assertGreater(orbit_amp, 10.2)
 
+        def test_v9_orbit_floor_pushes_outward_only_when_close(self):
+            """内切地板：只在快贴进柱角时往外推，正常绕行不受影响。
+
+            依据：柱半对角 141.4 + 鱼等效半宽 45 = 186.4 是绝对安全下限；
+            实测 orbit_1/orbit_3 最小半径 178.2 / 174.9，所以这条地板会被触发。
+            """
+            alpha = 2.0 / LOOP_R
+            c = RaceController()
+            c.section_index = 1
+            c.orbit = OrbitProgress(OBS1, 1)
+
+            def heading_at(radius):
+                # 放在正南（theta=-90°），逆时针切向就是 +x，heading 即角偏差。
+                x, y = OBS1[0], OBS1[1] - radius
+                c.velocity_x = c.velocity_y = 0.0
+                heading, _, _ = c._guidance(x, y)
+                return heading
+
+            # 安全半径上，地板不介入，就是纯 P 项。
+            self.assertAlmostEqual(heading_at(230.0),
+                                   math.atan2(2.0*(230.0-LOOP_R), LOOP_R), places=9)
+            # 本回路的方向约定：heading 偏移为正 -> 往圆内收；为负 -> 往外推。
+            # 地板要在半径过小时"往外推"，所以必须让角偏差比纯 P 项更负。
+            pure = math.atan2(2.0*(180.0-LOOP_R), LOOP_R)
+            self.assertLess(pure, 0.0)                 # 纯 P 项在 180 处已经在往外推
+            self.assertLess(heading_at(180.0), pure)   # 地板推得更狠
+            # 地板绝不能把"往外推"变成"往内收"。
+            self.assertLess(heading_at(ORBIT_R_FLOOR-5.0), 0.0)
+
+        def test_v9_floor_is_above_the_geometric_safety_limit(self):
+            """地板必须留在"柱半对角 + 鱼等效半宽"之上，否则等于指挥鱼进柱子。"""
+            self.assertGreater(ORBIT_R_FLOOR, PILLAR_HALF_DIAG + 40.0)
+            # 半径指令（含偏置）也绝不能把鱼指挥进柱角。
+            self.assertGreaterEqual(LOOP_R + ORBIT_RADIUS_BIAS,
+                                    PILLAR_HALF_DIAG + 40.0)
+
+        def test_v9_radial_damping_opposes_outward_drift(self):
+            """径向阻尼：正在外漂时提前向内修正，正在内漂时提前向外修正。"""
+            if USE_STABLE_PROFILE:
+                return
+            c = RaceController()
+            c.section_index = 1
+            c.orbit = OrbitProgress(OBS1, 1)
+            # 正南、半径正好 200：纯 P 项为 0，只剩阻尼项起作用。
+            x, y = OBS1[0], OBS1[1] - LOOP_R
+            c.velocity_x, c.velocity_y = 0.0, -120.0      # 径向向外
+            outward, _, _ = c._guidance(x, y)
+            c.velocity_x, c.velocity_y = 0.0, 120.0       # 径向向内
+            inward, _, _ = c._guidance(x, y)
+            c.velocity_x = c.velocity_y = 0.0
+            neutral, _, _ = c._guidance(x, y)
+            # 在正南、半径 200 处切向朝 +x，纯 P 项为 0。
+            self.assertAlmostEqual(neutral, 0.0, places=9)
+            # 本回路：正角偏差 = 往圆内收，负角偏差 = 往外推。
+            # 往外漂(径向速度为外) -> 提前收 -> 角偏差变大。
+            self.assertGreater(outward, neutral)
+            # 往内漂(径向速度为内) -> 提前放 -> 角偏差变小。
+            self.assertLess(inward, neutral)
+
+        def test_v9_telemetry_row_is_parseable_and_has_the_right_columns(self):
+            """--telemetry 的落盘行必须列数正确、可解析，且绕圈量取自实际用过的值。"""
+            self.assertEqual(len(TELEMETRY_HEADER.rstrip('\n').split(',')),
+                             TELEMETRY_FIELDS + 1)
+            c = RaceController()
+            # 非绕圈段：绕圈三列必须是 nan（而不是 0，避免被误读成真实观测）。
+            command = c.calculate(info(), now=1.0)
+            values = telemetry_row(c, command, 1.0).split(',')
+            self.assertEqual(len(values), TELEMETRY_FIELDS + 1)
+            self.assertEqual(values[1], 'approach_1')
+            for idx in (17, 18, 19):
+                self.assertTrue(math.isnan(float(values[idx])))
+            self.assertEqual(float(values[20]), 0.0)
+            # 绕圈段：半径列就是真实半径，且记录值与 _guidance 实际用过的值一致。
+            c.section_index = 1
+            c.tracker = PathTracker(c.sections[1].points)
+            c.orbit = OrbitProgress(OBS1, 1)
+            t = 1.0
+            command = None
+            for _ in range(30):     # 多喂几帧，让速度估计收敛
+                t += 1.0/60.0
+                command = c.calculate(
+                    info(x=OBS1[0], y=-LOOP_R, yaw=0.0), now=t)
+            values = telemetry_row(c, command, t).split(',')
+            self.assertEqual(len(values), TELEMETRY_FIELDS + 1)
+            self.assertEqual(values[1], 'orbit_1')
+            self.assertAlmostEqual(float(values[17]), LOOP_R, places=3)
+            self.assertEqual(float(values[19]), c.orbit.eff_radius_error)
+
+        def test_v9_depth_antiwindup_keeps_the_height_contract(self):
+            """抗饱和只在配平顶到同号上限时停积分；目标高度上仍无垂直动作。"""
+            # 契约不变：贴着目标高度飞，integral / ref_vz / pitch 恒为 0。
+            d = DepthController()
+            for _ in range(240):
+                d.calculate(HOLD_Z, 0.0, 0.0, 0.0, 500.0, 1.0/60.0)
+            self.assertEqual(d.integral, 0.0)
+            self.assertEqual(d.reference_vz, 0.0)
+            self.assertEqual(d.pitch_trim, 0.0)
+            # 真偏了、且配平还没饱和时，积分照常累积（控制律没被削弱）。
+            d2 = DepthController()
+            for _ in range(120):
+                d2.calculate(HOLD_Z-60.0, 0.0, 0.0, 0.0, 500.0, 1.0/60.0)
+            self.assertGreater(d2.integral, 0.0)
+            self.assertLessEqual(abs(d2.integral), 12.0)
+            # 配平已经顶住同号上限：不该再往同方向继续积累。
+            d3 = DepthController()
+            d3.pitch_trim = 35.0
+            for _ in range(120):
+                d3.calculate(HOLD_Z-60.0, 0.0, 0.0, 0.0, 500.0, 1.0/60.0)
+            self.assertLess(d3.integral, d2.integral)
+
         def test_v8_tail_swing_survives_the_worst_heading_error(self):
             """修正量顶到上限时，摆幅仍必须按各段预算足额发出。
 
@@ -1361,6 +1612,21 @@ def main():
     last_received = [None]
     last_report = [0.0]
     debug = '--debug' in sys.argv
+    # v9：可选的逐帧落盘（默认关闭，只在你显式加 --telemetry 时写）。
+    #   默认不写是为了不给比赛那一次引入任何多余 IO；分析时再开。
+    #   文件名固定为项目根目录的 race_telemetry.csv（.gitignore 已排除）。
+    telemetry = '--telemetry' in sys.argv
+    telemetry_log = None
+    telemetry_flush = [0.0]
+    if telemetry:
+        try:
+            telemetry_log = open(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'race_telemetry.csv'), 'w')
+            telemetry_log.write(TELEMETRY_HEADER)
+        except Exception as exc:
+            print('[telemetry] disabled: {}'.format(exc), flush=True)
+            telemetry_log = None
 
     def publish(command):
         message = mycue.FishCtrlInfo()
@@ -1388,6 +1654,12 @@ def main():
                 print('[error] {}: {}'.format(type(exc).__name__, exc), flush=True)
                 command = controller.stop('callback_error')
             publish(command)
+            if telemetry_log is not None:
+                telemetry_log.write(
+                    telemetry_row(controller, command, now) + '\n')
+                if now-telemetry_flush[0] > 0.4:
+                    telemetry_log.flush()
+                    telemetry_flush[0] = now
             if stage_before != controller.stage or (debug and now-last_report[0] >= 1.0):
                 elapsed = 0.0 if controller.started_at is None else now-controller.started_at
                 print('[race] {:.2f}s stage={} pos={} speed={:.1f}/{:.1f} yaw_error={:.1f} slip={:.1f} z_target={:.0f} vz={:.1f} pitch={:.1f}/{:.1f} wings=({:.1f},{:.1f}) laps={} stage_seconds={}'.format(
@@ -1424,6 +1696,13 @@ def main():
         # 保留subscriber引用直到退出；不要在DDS回调线程内销毁reader。
         with lock:
             publish(Command())
+            if telemetry_log is not None:
+                try:
+                    telemetry_log.flush()
+                    telemetry_log.close()
+                except Exception:
+                    pass
+                telemetry_log = None
         subscriber.close()
 
 
