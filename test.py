@@ -47,6 +47,30 @@ v7：高度锁定为"鱼的起点高度"（用户要求）。
 平台沿胸鳍GetUpVector施力；MakeRotator(0, angle, 0)下，
 angle=0为向上推，angle=-90才是沿鱼身向前推，不能再将胸鳍限制在±25。
 本包蓝图的VelLimit对各轴速度限幅，不能靠无限增加目标速度突破。
+
+v8：绕圈段的"尾摆被 DC 挤死"专项（依据取自自测附带的 on-car 遥测）。
+  取证（逐帧遥测 + 几何复算，见 AGENTS.md 第 7.4 节）：
+    ① 绕圈实测半径中位 230 / 229.6mm（目标 200），与计划圆比多跑
+       orbit_1 +299mm、orbit_3 +266mm，折算约 +2.0s——与长尾量级一致。
+    ② 对 Tail(t) 做单频最小二乘：绕圈段摆幅只有 10.2° / 9.4°，
+       而**未被裁**的穿缝段是 20.9°。也就是说绕圈段的摆尾被砍掉了一半，
+       与此同时 DC 却顶到 58~64（±80 限幅的 p95 处）。
+    ③ 摆尾正弦是零均值的：它不产生净转向，只产生推进。所以"DC 逼近限幅 ->
+       摆幅被 min(amp, 80-|correction|) 裁到接近 0"的净后果是**把推进关掉**。
+       实测该段速度中位仅 268~277mm/s，而穿缝段满推力能到 376~493。
+    ④ 该段实测偏航率对速度的相关性是 +0.72~+0.80，说明鱼远未到转弯能力上限；
+       而曲率限速给绕圈段的目标速度是 626，实测只跑到 268~277（44%）。
+  据此改两处（都是"把推进还回来"，不是放宽安全边界）：
+    · 摆幅与修正量的优先级对调：DC 上限 = MAX_TAIL - 本段摆幅，
+      于是摆幅**永不被裁**，不再出现"DC 顶满、尾巴不摆"的死区。
+      代价是修正量上限从 62 降到 56（绕圈）/48（直道）。参考实现
+      （18s 内、最快 15.45s）也是这个次序：DC_LIM = TAIL_LIMIT - 30。
+    · 绕圈回收推力只对"贴柱侧"生效（v7 的 abs() 把向心与离心一视同仁，
+      而实测里**所有**真实偏差都在离心侧），并保留 >110mm 外漂的失控兜底。
+  明确不改：MAX_THRUST / MAX_TAIL / 安全间隙 55 / 圈数判定 / 路径几何 / HOLD_Z。
+  想只看摆幅那一半：把 TAIL_GAIN 改回 1.0（优先级对调仍保留）。
+  实测由用户执行；未实测，不能保证耗时。
+
 命令行加 --stable 可使用v2平面路线/速度参数；平台不方便传参时，
 将下方 USE_STABLE_PROFILE 改为 True。两种模式都使用修正后的高度控制，
 不恢复旧版的向上推力错误。两种模式都保留全部圈数和限幅。
@@ -82,7 +106,8 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = 'race-v7-stable-hold-z' if USE_STABLE_PROFILE else 'race-v7-hold-start-z'
+PROFILE_NAME = ('race-v8-stable-hold-z' if USE_STABLE_PROFILE
+                else 'race-v8-hold-start-z')
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -108,11 +133,48 @@ TAIL_TURN_HZ = (3.3 if USE_STABLE_PROFILE else 3.6) * SPEED_GAIN
 TAIL_AMPLITUDE_STRAIGHT = 24.0 * SPEED_GAIN
 TAIL_AMPLITUDE_TURN = 18.0 * SPEED_GAIN
 GAP_TAIL_AMPLITUDE = 8.0 * SPEED_GAIN
+
+# ===================== v8：绕圈"有效舵量"专项（本版唯一实质改动）=====================
+# 依据（自测附带的 on-car 遥测 + 几何复算，口径见下）：
+#   1) 绕圈段实测半径中位数 230 / 229.6mm（目标 200），与计划圆比多跑
+#      orbit_1 +299mm、orbit_3 +266mm，折算约 +2.0s —— 与长尾量级一致。
+#   2) 同一段实测偏航率对速度的相关性是 +0.72~+0.80：速度越快转得越快，
+#      说明鱼在这段**远未到转弯能力上限**，是"没让鱼转"而不是"鱼转不动"。
+#   3) 尾舵约 2~3% 的帧贴死 ±80 硬限幅，且 p50 已达 58~64：**DC 修正已经把尾轴
+#      推到上限**，留给前面摆尾正弦的幅值只剩几度。
+#   4) 摆尾正弦是**零均值**的：它不产生净转向，只产生推进。所以"绕圈时把修正量
+#      限死、并把幅值裁到极小"的真正后果是——**把推进几乎关掉了**：实测该段
+#      速度中位仅 268~277mm/s，而穿缝段满推力能跑到 376~493mm/s。
+# 结论：绕圈慢的主因是**修正量与摆幅在同一个尾角预算里互相抢**，不是半径只要 200。
+
+# ① 尾摆幅值单独一提速系数（不动 SPEED_GAIN，避免把目标速度一起放大又去撞限幅簧）。
+#    绕圈 20.9 -> 24.0，直道 27.8 -> 32.0；与"尾摆频率/幅值才是推进量"的既有结论一致。
+TAIL_GAIN = 1.15
+# ② （已删除的候选）绕圈限速系数：核查后确认**无效**——曲率 1/200 处
+#    sqrt(TURN_ACCEL_BUDGET/κ) = 626.8 本来就已被 TURN_SPEED=626.4 卡住，
+#    再抬预算也只是换个数被同一个天花板接住，所以没有任何效果。
+#    反过来这条数据更有用：绕圈段的目标速度是 626，实测只有 268~277，
+#    即鱼只跑到目标的 44%——**绕圈慢不是目标速度设得低，而是推进上不去**。
+
+# ③ 最关键的一条：**修正量（DC）的限幅必须从摆幅里让位**。
+#    参考实现（18s 内、最快 15.45s）就是这么写的：DC_LIM = TAIL_LIMIT - 30，
+#    先把摆尾幅值的额度全额留出，再谈修正。v7 的顺序正好相反——
+#    `amplitude = min(amplitude, MAX_TAIL - |correction|)`，
+#    DC 一逼近上限就把摆幅裁到接近 0，等于把推进关掉。
+#    实测佐证：对 Tail(t) 做单频最小二乘，绕圈段的摆幅拟合值只有 10.2 / 9.4°，
+#    而未被裁的穿缝段是 20.9°——**绕圈段的摆尾被砍掉一半**，DC 却顶到 58~64。
+#    这里改成"DC 上限 = 硬限幅 - 本段摆幅"，于是摆幅**永不**被裁；
+#    代价是修正量上限随之降到 56（绕圈）/ 48（直道），但实测偏航率与速度相关系数
+#    是 +0.72~+0.80，
+#    说明鱼远未到转弯能力上限，让出这部分修正是划算的。
 # 穿缝未对正时的保守速度上限；与横向偏移减速曲线在同一尺度上。
 GAP_ALIGN_SPEED = 280.0 * SPEED_GAIN
 GAP_LANE_FLOOR = 250.0 * SPEED_GAIN
 # 绕圈偏离圆周后重新贴回的推力上限（安全限幅，只按系数微调）。
 ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
+# v8：严重外漂的安全底线。向外漂到这一档就不只是"漂宽"，而是失控了，
+#   无论方向一律收推力（实测该段最大外漂 118.8mm）。
+ORBIT_RECAPTURE_HARD_BAND = 110.0
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -601,7 +663,7 @@ class RaceController:
         heading = math.atan2(dy, dx)+math.pi/2+math.atan2(3.0*radius_error, LOOP_R)
         return _wrap(heading), 1.0/LOOP_R, 1.0/LOOP_R
 
-    def _motion_profile(self, curvature, error, x, y):
+    def _motion_profile(self, curvature, error, x, y, correction=0.0):
         """提速不绕过安全条件：只有对正窄缝/跟稳圆弧时才使用快档。"""
         target_speed = CRUISE_SPEED
         if curvature > 0.0015:
@@ -632,8 +694,14 @@ class RaceController:
         if self.orbit is not None:
             cx, cy = self.orbit.center
             radial_error = math.hypot(x-cx, y-cy)-LOOP_R
-            if abs(radial_error) > 40.0:
-                thrust = min(thrust, ORBIT_RECAPTURE_THRUST)  # 偏离圆周后先收回轨迹，再加速
+            # v8：只对"贴柱侧"（真实向心偏差）收推力。v7 的 abs() 把向心与离心
+            # 一视同仁，于是实测里**所有**回归圆弧的帧（离心侧）都被误判成偏离、
+            # 把推力钳到 32.6，速度掉到 237——等于为了"回收"反而拖慢。
+            #   注：这不是新发现。v7.5（已被整体回退）就已按实测定性"不要再偏出就
+            #   踩刹车"，并量化出 421/820 帧被误钳。这里只保留其中最小、最不可
+            #   或缺的那一半：只对"贴柱侧"收推力。
+            if radial_error < -40.0 or radial_error > ORBIT_RECAPTURE_HARD_BAND:
+                thrust = min(thrust, ORBIT_RECAPTURE_THRUST)
         if self.entry_avoidance:
             thrust = min(thrust, ORBIT_RECAPTURE_THRUST)
         turning = curvature > 0.003
@@ -641,7 +709,10 @@ class RaceController:
         amplitude = TAIL_AMPLITUDE_TURN if turning else TAIL_AMPLITUDE_STRAIGHT
         if not USE_STABLE_PROFILE and self.stage == 'slalom_2' and abs(x) < 240.0:
             amplitude = GAP_TAIL_AMPLITUDE  # 窄缝内缩小摆尾，保留前向推力，减少左右纠偏。
-        return thrust, frequency, amplitude
+        # v8：摆幅优先于修正量。DC 的上限由"硬限幅 - 本段摆幅"给出，于是摆幅
+        #   **永不被裁**（v7 的 DC 限幅 62 会把绕圈段摆幅砍掉一半，见常量块④）。
+        amplitude = amplitude * TAIL_GAIN
+        return thrust, frequency, amplitude, MAX_TAIL - amplitude
 
     def calculate(self, fish_info, now=None):
         if self.finished:
@@ -731,8 +802,12 @@ class RaceController:
             feedforward = _constrain(feedforward, -30.0, 30.0)
         correction = _constrain(self.pid.calculate(error, dt)+feedforward, -62.0, 62.0)
 
-        thrust, frequency, amplitude = self._motion_profile(curvature, error, x, y)
-        # 先为转向预留尾角空间，避免单侧裁剪正弦波改变平均转向量。
+        thrust, frequency, amplitude, dc_limit = self._motion_profile(
+            curvature, error, x, y, correction)
+        # v8：反过来，先按"硬限幅 - 摆幅"定 DC 的上限，再让摆幅原样通过。
+        # 于是绕圈段的摆幅从实测的 10.2° 恢复到 24.0°（推进回来了），
+        # 代价是 DC 上限从 62 降到 56；直道 32.7°摆幅时 DC 上限 47.3。
+        correction = _constrain(correction, -dc_limit, dc_limit)
         amplitude = min(amplitude, MAX_TAIL-abs(correction))
         self.phase = (self.phase + 2.0*math.pi*frequency*dt) % (2.0*math.pi)
         tail = correction + amplitude*math.sin(self.phase)
@@ -888,7 +963,7 @@ def self_test():
         def test_fast_profile_and_smooth_steering_cap(self):
             c = RaceController()
             c.speed = 430.0
-            thrust, frequency, _ = c._motion_profile(1.0/LOOP_R, 0.0, -750.0, -LOOP_R)
+            thrust, frequency, _, _ = c._motion_profile(1.0/LOOP_R, 0.0, -750.0, -LOOP_R)
             self.assertGreater(thrust, 44.0)
             self.assertEqual(c.target_speed, TURN_SPEED)
             self.assertGreater(frequency, 2.8)
@@ -985,10 +1060,12 @@ def self_test():
                 return
             c = RaceController()
             c.section_index = 2
-            thrust, _, amplitude = c._motion_profile(0.0, 15.0, 0.0, 0.0)
+            thrust, _, amplitude, _ = c._motion_profile(0.0, 15.0, 0.0, 0.0)
             self.assertEqual(c.target_speed, GAP_SPEED)
             self.assertEqual(thrust, MAX_THRUST)
-            self.assertEqual(amplitude, GAP_TAIL_AMPLITUDE)
+            # v8：摆幅统一乘了 TAIL_GAIN（窄缝的"缩小摆尾"本身保持不变）。
+            self.assertAlmostEqual(amplitude, GAP_TAIL_AMPLITUDE*TAIL_GAIN)
+            self.assertLess(amplitude, TAIL_AMPLITUDE_TURN*TAIL_GAIN)
             c.velocity_y = 180.0
             c._motion_profile(0.0, 0.0, 0.0, 0.0)
             self.assertLess(c.target_speed, GAP_SPEED)
@@ -1026,11 +1103,69 @@ def self_test():
             self.assertEqual((c.velocity_x, c.velocity_y), (0.0, 0.0))
 
         def test_orbit_recapture_limits_thrust(self):
+            """v8：回收只针对"贴柱侧"（向心）偏差，离心侧不该被误刹车。"""
             c = RaceController()
             c.section_index = 1
             c.orbit = OrbitProgress(OBS1, 1)
-            thrust = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R-60.0)[0]
+            # 离心侧：半径 260（实测里**所有**真实偏差都在这一侧）——不该被刹车。
+            thrust_out = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0],
+                                           -LOOP_R-60.0)[0]
+            self.assertGreater(thrust_out, ORBIT_RECAPTURE_THRUST)
+            # 向心侧：半径 140，已进入方柱半对角线以内，真危险时才收推力。
+            thrust = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R+60.0)[0]
             self.assertLessEqual(thrust, ORBIT_RECAPTURE_THRUST)
+            # 严重外漂（>ORBIT_RECAPTURE_HARD_BAND）是失控，无论方向一律回收。
+            hard = c._motion_profile(
+                1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R-ORBIT_RECAPTURE_HARD_BAND-20.0)[0]
+            self.assertLessEqual(hard, ORBIT_RECAPTURE_THRUST)
+
+        def test_v8_tail_swing_never_truncated(self):
+            """v8 核心：DC 限幅必须为摆幅让位，尾摆不能再被裁掉。
+
+            依据：对 Tail(t) 做单频最小二乘，绕圈段实测摆幅只有 10.2 / 9.4°，
+            而未被裁的穿缝段是 20.9°——v7 的 `min(amp, 80-|correction|)`
+            把绕圈段的摆尾砍掉一半，等于把推进关掉（该段速度中位仅 268~277）。
+            """
+            c = RaceController()
+            for curvature, error, x, y in ((1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R),
+                                           (0.0, 0.0, -1100.0, 0.0)):
+                if curvature == 0.0:
+                    c.orbit = None
+                thrust, frequency, amplitude, dc_limit = c._motion_profile(
+                    curvature, error, x, y)
+                # 摆幅不被 DC 限幅侵蚀：上限正好是"硬限幅 - 摆幅"。
+                self.assertAlmostEqual(dc_limit, MAX_TAIL-amplitude)
+                # 峰值不会越过平台硬限幅。
+                self.assertLessEqual(amplitude+dc_limit, MAX_TAIL+1e-9)
+                self.assertTrue(amplitude > 0.0)
+            # 绕圈段摆幅必须明显大于 v7 实测被裁后的 10.2°，也不再被裁。
+            c.orbit = OrbitProgress(OBS1, 1)
+            _, _, orbit_amp, _ = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R)
+            self.assertAlmostEqual(orbit_amp, TAIL_AMPLITUDE_TURN*TAIL_GAIN, places=6)
+            self.assertGreater(orbit_amp, 10.2)
+
+        def test_v8_tail_swing_survives_the_worst_heading_error(self):
+            """修正量顶到上限时，摆幅仍必须按各段预算足额发出。
+
+            v7 的失效模式是：|correction| 一逼近 62，摆幅就被裁到接近 0。
+            这里逐段验证"最坏情况"下 amplitude 仍等于该段的摆幅预算。
+            """
+            c = RaceController()
+            for name, section in (('orbit', 1), ('slalom', 2), ('finish', 4)):
+                c.section_index = section
+                c.orbit = (OrbitProgress(c.sections[section].center,
+                                         c.sections[section].laps)
+                           if c.sections[section].center else None)
+                x = c.sections[section].points[0][0]
+                y = c.sections[section].points[0][1]
+                # 用极大的 heading error 把 correction 顶到该段上限。
+                _, _, amplitude, dc_limit = c._motion_profile(0.0, 179.0, x, y)
+                correction = _constrain(max(dc_limit, 62.0), -dc_limit, dc_limit)
+                self.assertAlmostEqual(correction, dc_limit)
+                self.assertGreaterEqual(amplitude, 0.0)
+                # 摆幅 + 修正量 恰好铺满硬限幅，没有"两边都留白"的浪费。
+                self.assertAlmostEqual(correction+amplitude, MAX_TAIL)
+
 
         def test_fast_path_length_and_speed_envelope(self):
             length = sum(math.hypot(b[0]-a[0], b[1]-a[1])
@@ -1041,7 +1176,7 @@ def self_test():
             for speed in (0.0, 300.0, 430.0, 550.0, 800.0):
                 c.speed = speed
                 for error in (0.0, 40.0, -40.0, 90.0, -180.0):
-                    thrust, frequency, amplitude = c._motion_profile(
+                    thrust, frequency, amplitude, _ = c._motion_profile(
                         1.0/LOOP_R, error, OBS1[0], -LOOP_R)
                     self.assertTrue(0.0 <= thrust <= MAX_THRUST)
                     self.assertTrue(math.isfinite(frequency) and math.isfinite(amplitude))
