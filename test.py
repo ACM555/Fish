@@ -100,6 +100,29 @@ v9：只稳"绕第三柱"，其它一概不动（用户要求：先回退到 v8�
   明确不改：MAX_THRUST / MAX_TAIL / 安全间隙 55 / 圈数判定 / 路径几何 / HOLD_Z。
   实测由用户执行；未实测，不能保证耗时，也不能保证一次就不撞。
 
+  实测补充（用户反馈"绕圈时鱼尾一直不停摆动、不丝滑；一轮转弯应该转完就笔直走"）：
+    · 直接量"航迹方向 − 圆切向"（gamma，只用位置、不依赖任何遥测符号约定）：
+      orbit_1 mean=-0.30° / orbit_3 mean=+0.88°，但 |gamma| 均值高达 23~24°、
+      p10~p90 是 -35°~+38°。所以**不是**恒定蟹角偏置（参考文献的 BETA_ARC
+      不是这里的解），而是**航迹绕着圆来回摆 ±35°**——鱼一会儿朝内一会儿朝外，
+      这正是"不丝滑"的物理来源。
+    · 同一份数据里绕圈段 DC 在 ±72° 之间来回打（p2p 145°）、推力是"50 或 33"
+      的开关式（50% 的帧顶在 50，20% 被钳到 <=35）、corr(半径,速度)=-0.67。
+      三件事互相咬合，所以单纯"加大推进"或"加大修正"都会把摆动放大。
+  v8 是我把绕圈摆幅从被截断的 ~10° 放开到 24°，**用户看到的"尾巴一直甩"
+  有这一份责任**，本版据此修正。
+  本轮只在绕圈段再加一项：
+    · 绕圈摆幅改成**小且固定**（ORBIT_TAIL_AMPLITUDE=15）：小是为了接近
+      "转完就走"的干脆感；**固定**是为了不参与 min(amp, MAX_TAIL-|correction|)
+      的裁剪，从而不会出现"时而满幅、时而几乎没有"的抖动观感。
+      DC 上限随之是 65，比 v8 的 56 还宽，修正能力没有被削弱。
+    · 加上上一轮已落地的贴柱保底软墙(214/0.6)与径向阻尼(0.18)，一并针对
+      "绕第三柱不稳 + 不丝滑"。
+  代价要说清：绕圈推进量下降，该段可能变慢。想调手感就把 ORBIT_TAIL_AMPLITUDE
+  在 12~20 之间试；20~24 等于回到 v8 的"甩"。
+  --stable 档仍不与 v7 有任何差异。
+  实测由用户执行；未实测，不能保证耗时，也不能保证一次就不撞。
+
 命令行加 --stable 可使用v2平面路线/速度参数；平台不方便传参时，
 将下方 USE_STABLE_PROFILE 改为 True。两种模式都使用修正后的高度控制，
 不恢复旧版的向上推力错误。两种模式都保留全部圈数和限幅。
@@ -230,6 +253,21 @@ ORBIT_KEEP_GAIN = 0.60
 #    T=0.10 -> 净 +5°（几乎无效）、T=0.18 -> 净 +21°（本版取值）、
 #    T=0.30 -> 净 +35°（更硬，可再试）。上限是 LOOP_R/v≈0.72s，再大易变正反馈。
 ORBIT_RADIAL_DAMP = 0.18
+
+# ③ 绕圈段的摆尾幅值（最终发出去的角度，不再乘 TAIL_GAIN）。
+#    用户反馈："绕圈时鱼尾一直不停摆动，不够丝滑；一轮转弯应该是转完就笔直走。"
+#    实测印证——绕圈段的修正量（DC）会在 ±72° 之间来回打（p2p 145°），
+#    航向误差中位数 28°、26% 的帧超过 40°。也就是说尾巴**同时**在干两件事：
+#    大幅修正方向 + 大幅摆动推进，看起来就是"一直甩个不停"。
+#    而 v8 把绕圈段的摆幅从被截断的 ~10° 放开到 24°（为了把推进还回来），
+#    视觉上进一步放大了这个"甩"。本版把绕圈段换成更小的固定幅值：
+#      · 小：视觉上靠近"转完就走"的干脆感；
+#      · **固定**：不参与 min(amplitude, MAX_TAIL-|correction|) 的裁剪，
+#        所以不会出现"时而满幅、时而几乎没有"的抖动感（v7 那种被裁的样子）。
+#    DC 上限仍是 MAX_TAIL - 本幅值 = 65，所以摆幅永不被裁、也不越硬限幅。
+#    代价：绕圈推进量下降，该段可能变慢。若觉得太慢，把它调到 18；想要更快
+#    但更"甩"，调到 20~24（v8 的等效值）。
+ORBIT_TAIL_AMPLITUDE = 15.0
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -783,6 +821,10 @@ class RaceController:
         # v8：摆幅优先于修正量。DC 的上限由"硬限幅 - 本段摆幅"给出，于是摆幅
         #   **永不被裁**（v7 的 DC 限幅 62 会把绕圈段摆幅砍掉一半，见常量块④）。
         amplitude = amplitude * TAIL_GAIN
+        # v9：绕圈段改用更小的**固定**摆幅（见常量块③）。放在 TAIL_GAIN 之后覆盖，
+        #   所以这个数是最终发出去的度数，调参时不用再乘系数。
+        if not USE_STABLE_PROFILE and self.orbit is not None:
+            amplitude = ORBIT_TAIL_AMPLITUDE
         return thrust, frequency, amplitude, MAX_TAIL - amplitude
 
     def calculate(self, fish_info, now=None):
@@ -1191,12 +1233,16 @@ def self_test():
             self.assertLessEqual(hard, ORBIT_RECAPTURE_THRUST)
 
         def test_v8_tail_swing_never_truncated(self):
-            """v8 核心：DC 限幅必须为摆幅让位，尾摆不能再被裁掉。
+            """v8 核心：DC 限幅必须为摆幅让位，尾摆不能被 DC 截断。
 
             依据：对 Tail(t) 做单频最小二乘，绕圈段实测摆幅只有 10.2 / 9.4°，
             而未被裁的穿缝段是 20.9°——v7 的 `min(amp, 80-|correction|)`
             把绕圈段的摆尾砍掉一半，等于把推进关掉（该段速度中位仅 268~277）。
+            v9 进一步把绕圈幅值**单独取小且固定**（见 ORBIT_TAIL_AMPLITUDE），
+            所以这里只断言"不被截断、不越限幅"，不再要求它等于 TAIL 系列常量。
             """
+            if USE_STABLE_PROFILE:
+                return          # --stable 档保持与 v7 一致，不做绕圈改动
             c = RaceController()
             for curvature, error, x, y in ((1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R),
                                            (0.0, 0.0, -1100.0, 0.0)):
@@ -1209,11 +1255,40 @@ def self_test():
                 # 峰值不会越过平台硬限幅。
                 self.assertLessEqual(amplitude+dc_limit, MAX_TAIL+1e-9)
                 self.assertTrue(amplitude > 0.0)
-            # 绕圈段摆幅必须明显大于 v7 实测被裁后的 10.2°，也不再被裁。
+            # 绕圈段：固定值，且不小于"刚好把 DC 上限提到 65"所要求的 15。
             c.orbit = OrbitProgress(OBS1, 1)
             _, _, orbit_amp, _ = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R)
-            self.assertAlmostEqual(orbit_amp, TAIL_AMPLITUDE_TURN*TAIL_GAIN, places=6)
-            self.assertGreater(orbit_amp, 10.2)
+            self.assertAlmostEqual(orbit_amp, ORBIT_TAIL_AMPLITUDE, places=6)
+            # 非绕圈段仍按 TAIL 系列（含 TAIL_GAIN）走，不受本项影响。
+            c.orbit = None
+            _, _, straight_amp, _ = c._motion_profile(0.0, 0.0, -1100.0, 0.0)
+            self.assertAlmostEqual(straight_amp,
+                                   TAIL_AMPLITUDE_STRAIGHT*TAIL_GAIN, places=6)
+
+        def test_v9_orbit_tail_amplitude_is_small_and_fixed(self):
+            """绕圈摆幅必须"小且固定"——这是用户要的"转完就笔直走"的手感。
+
+            实测：绕圈段 DC 在 ±72° 来回打（p2p 145°），航向误差中位数 28°、
+            26% 的帧 >40°。幅值再叠 24° 就是"一直甩个不停"。
+            固定幅值的意义：不参与 min(amp, MAX_TAIL-|correction|)，所以不会
+            出现"时而满幅、时而几乎没有"的抖动观感（v7 被裁时的样子）。
+            """
+            if USE_STABLE_PROFILE:
+                return          # --stable 档保持与 v7 一致，不做绕圈改动
+            c = RaceController()
+            c.orbit = OrbitProgress(OBS1, 1)
+            # 固定：不随 heading error 变化。
+            amps = set()
+            for err in (0.0, 20.0, 60.0, 179.0, -179.0):
+                amps.add(round(c._motion_profile(1.0/LOOP_R, err,
+                                                 OBS1[0], -LOOP_R)[2], 9))
+            self.assertEqual(len(amps), 1, '绕圈幅值必须与航向误差无关')
+            self.assertAlmostEqual(amps.pop(), ORBIT_TAIL_AMPLITUDE, places=9)
+            # 小：要明显低于原有的转弯档幅值，才谈得上"干脆"。
+            self.assertLess(ORBIT_TAIL_AMPLITUDE,
+                            TAIL_AMPLITUDE_TURN*TAIL_GAIN)
+            # 足够给 DC 留出 65° 的修正上限（15 是这条的下限）。
+            self.assertGreaterEqual(MAX_TAIL-ORBIT_TAIL_AMPLITUDE, 65.0)
 
         def test_v9_orbit_keep_floor_sits_above_the_geometric_limit(self):
             """贴柱保底线必须留出真实的鱼体间隙，而不只是"数字上大于半对角"。
