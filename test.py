@@ -71,57 +71,36 @@ v8：绕圈段的"尾摆被 DC 挤死"专项（依据取自自测附带的 on-ca
   想只看摆幅那一半：把 TAIL_GAIN 改回 1.0（优先级对调仍保留）。
   实测由用户执行；未实测，不能保证耗时。
 
-v9：只稳"绕第三柱"，其它一概不动（用户要求：先回退到 v8，然后只确保绕第三柱
-    稳定、保持高度一致，其余不变）。
-  实测证据（race_telemetry.csv 逐帧 + 最小二乘圆拟合）：
-    · orbit_1：拟合半径 225.9、半径 std 24.8、实测最小 178.2，z 标准差 0.4mm。
-    · orbit_3：拟合半径 229.8、半径 std 32.8、**实测最小 174.9**，z 标准差 5.2mm。
-    两段拟合圆心只偏 6~12mm，所以"圆心偏了"不是主因；主因是**半径贴柱**。
-  几何账（最坏方向=柱角 45°，实测柱半对角 141.4、鱼等效半宽 45）：
-      r=174.9 -> 柱子就 33.5mm，减去鱼半宽 = **-11.5mm，已经撞进柱子里**
-      r=186.4 -> 刚好贴上（这已是安全下限）
-      r=200（指令半径）-> +13.6mm 间隙
-      r=214（本版保底线）-> **+27.6mm 间隙**
-  所以 orbit_3 的"撞到"不是玄学，是半径在小段里跌破了 186.4。两处改动：
-    · 贴柱保底软墙 ORBIT_KEEP_R=214 / ORBIT_KEEP_GAIN=0.6：半径低于 214
-      就额外往外推。取 214 而不是贴着 186.4，是为了给"发现->转向->生效"
-      留时间余量（按 v≈278mm/s、偏航率上限约 115deg/s 估，从 214 修回 200
-      约需 0.25s / 70mm 路程）。
-    · 径向阻尼 ORBIT_RADIAL_DAMP=0.18：给纯 P 的径向回路加微分项，抑制振荡。
-      注意径向速度估计本身有一阶滤波（τ≈0.08s），相位收益是
-      atan(T*ω) - atan(0.08*ω)；ω≈5.15rad/s 时 T=0.18 净领先约 +21°。
-  两处都只在"绕圈且偏内/正在漂"时生效：在目标半径上、径向速度为零时
-  导引与 v7 **逐位一致**，有 test_v9_orbit_happy_path_matches_v7_guidance 守着，
-  所以 orbit_1、approach_1、slalom_2、finish 的行为不变。
-  高度不做改动：实测 orbit_1/orbit_3 的 z 标准差只有 0.4 / 5.2mm，且两段
-  100% 的帧都在 ±12mm 死区里，深度回路没有失控；用户看到的"高度变化"是
-  orbit_3 的 ±7mm 慢漂。**不要**为此去加积分权限——v7.2 就是那么把高度摆幅
-  从 ±5mm 放大成 ±67mm 的。
+v10：绕圈径向阻尼（只加一项，且这一项不改变稳态）。附三轮失败尝试的复盘。
+  先把实测成绩摆出来（project1.csv，按提交时间切分）：
+    v8 (ddda28d)              n=6 中位 18.90 最好 17.36   <- 目前最好
+    v9 全量 (58bdd47)         n=2 中位 20.98
+    v9 贴柱软墙+阻尼 (76eb152) n=4 中位 19.60
+    v9 小摆幅 (68c5058)       n=3 中位 20.09
+  我前面三轮绕圈改动**全部更慢**，因此整体回退到 v8，再逐个找原因：
+    · 贴柱软墙：等效把指令半径往外推 -> 路径变长 -> 更慢。**有害，已删。**
+    · 小摆幅 15：推进量下降 -> 更慢，且并未解决"甩尾"。**有害，已删。**
+    · 降径向增益（试到参考实现的等效 0.4 倍）：离线模型显示会把平均半径
+      从 261 推到 329（+26% 路径）-> 也是变慢的方向。**有害，已删。**
+    三者共同点：**都改变了稳态或推进量**，所以都直接换来"路径更长/推得更少"。
+  本轮只保留唯一一个**不改变稳态**的手段——径向阻尼：
+    heading += atan2(2*(radius_error + ORBIT_RADIAL_DAMP*radial_speed), LOOP_R)
+  阻尼项正比于**径向速度**：稳态绕行时径向速度为零，因此它不改变稳态半径、
+  不改变航向指令的平均值，也就没有路径长度代价；它只在"正在漂"的时候出手。
+  这正是前面三轮和它最关键的区别。
+  观感依据（用户："绕圈时鱼尾一直不停摆动、不丝滑"）：绕圈段修正量在 ±72° 之间
+  来回打（p2p 145°）、|航向误差| 中位数 28°、26% 的帧 >40°；只用位置算出的
+  "航迹方向 − 圆切向"虽**均值为零**（-0.30°/+0.88°，所以不是恒定蟹角偏置、
+  参考实现的 BETA_ARC 不适用），但**幅值达 ±35°**（p10~p90 = -35°~+38°）。
+  阻尼是唯一能在不改稳态的前提下压这份过冲的手段。
+  取值：径向速度估计自身一阶滤波 τ≈0.08s，实测振荡周期 1.22s（ω≈5.15rad/s）：
+    T=0.10 -> 净领先仅 +5°（几乎无效）、T=0.18 -> 净 +21°（本轮）、
+    T=0.30 -> 净 +35°。上限 LOOP_R/v≈0.72s。
+  验收（AGENTS.md 7.6）：(1) |gamma| 均值是否从 23° 下降；
+    (2) orbit 段 stage_seconds 是否不比 v8 差；(3) 是否仍撞柱。
   明确不改：MAX_THRUST / MAX_TAIL / 安全间隙 55 / 圈数判定 / 路径几何 / HOLD_Z。
-  实测由用户执行；未实测，不能保证耗时，也不能保证一次就不撞。
-
-  实测补充（用户反馈"绕圈时鱼尾一直不停摆动、不丝滑；一轮转弯应该转完就笔直走"）：
-    · 直接量"航迹方向 − 圆切向"（gamma，只用位置、不依赖任何遥测符号约定）：
-      orbit_1 mean=-0.30° / orbit_3 mean=+0.88°，但 |gamma| 均值高达 23~24°、
-      p10~p90 是 -35°~+38°。所以**不是**恒定蟹角偏置（参考文献的 BETA_ARC
-      不是这里的解），而是**航迹绕着圆来回摆 ±35°**——鱼一会儿朝内一会儿朝外，
-      这正是"不丝滑"的物理来源。
-    · 同一份数据里绕圈段 DC 在 ±72° 之间来回打（p2p 145°）、推力是"50 或 33"
-      的开关式（50% 的帧顶在 50，20% 被钳到 <=35）、corr(半径,速度)=-0.67。
-      三件事互相咬合，所以单纯"加大推进"或"加大修正"都会把摆动放大。
-  v8 是我把绕圈摆幅从被截断的 ~10° 放开到 24°，**用户看到的"尾巴一直甩"
-  有这一份责任**，本版据此修正。
-  本轮只在绕圈段再加一项：
-    · 绕圈摆幅改成**小且固定**（ORBIT_TAIL_AMPLITUDE=15）：小是为了接近
-      "转完就走"的干脆感；**固定**是为了不参与 min(amp, MAX_TAIL-|correction|)
-      的裁剪，从而不会出现"时而满幅、时而几乎没有"的抖动观感。
-      DC 上限随之是 65，比 v8 的 56 还宽，修正能力没有被削弱。
-    · 加上上一轮已落地的贴柱保底软墙(214/0.6)与径向阻尼(0.18)，一并针对
-      "绕第三柱不稳 + 不丝滑"。
-  代价要说清：绕圈推进量下降，该段可能变慢。想调手感就把 ORBIT_TAIL_AMPLITUDE
-  在 12~20 之间试；20~24 等于回到 v8 的"甩"。
-  --stable 档仍不与 v7 有任何差异。
-  实测由用户执行；未实测，不能保证耗时，也不能保证一次就不撞。
+  --stable 档仍与 v7 零差异。
+  实测由用户执行；未实测，不能保证耗时。
 
 命令行加 --stable 可使用v2平面路线/速度参数；平台不方便传参时，
 将下方 USE_STABLE_PROFILE 改为 True。两种模式都使用修正后的高度控制，
@@ -228,46 +207,51 @@ ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
 #   无论方向一律收推力（实测该段最大外漂 118.8mm）。
 ORBIT_RECAPTURE_HARD_BAND = 110.0
 
-# ===================== v9：绕第三柱的稳定性（用户要求：只稳 orbit_3，其它不变）=====
-# 用户反馈："绕第三个障碍物状态不稳定，要么撞到要么高度一直变化。"
-# 先看实测（race_telemetry.csv 逐帧，最小二乘圆拟合 + 分布统计）：
-#   · orbit_1：拟合半径 225.9、半径 std 24.8、最小 178.2，z 标准差 0.4mm —— 稳。
-#   · orbit_3：拟合半径 229.8、半径 std 32.8、**最小 174.9**，z 标准差 5.2mm —— 差。
-#   拟合圆心只偏 6~12mm，所以"圆心偏了"不是主因；主因是**半径贴着柱角**，
-#   而 orbit_3 要连绕 2 圈、又紧跟 S 弯入圈，所以更容易踩到。
-# 安全下限是几何给的、没有商量余地：柱半对角 141.5 + 鱼等效半宽 45 = 186.5。
-# orbit_3 实测最小 174.9 已经**越过这条线下 11.6mm**——这就是"撞到"的来源，
-# 也是 v9 唯一要解决的问题。因此本版的两处改动都只在"绕圈且太靠里"时生效：
-
-# ① 绕圈贴柱保底半径。半径低于它就额外往外推，把它当成"软墙"接住内切俯冲。
-#    取 214 而不是贴着 186.5，是为了给"发现→转向→生效"留出时间余量：
-#    按实测 v≈278mm/s、偏航率上限约 115deg/s 估算，半径从 214 修回 200
-#    只需约 0.25s（≈70mm 路程），足够在真正进柱角之前把趋势扭回来。
-ORBIT_KEEP_R = 214.0
-# 保底项强度：把"越过保底线多少 mm"折算成额外的半径误差。1.0 表示一比一折算。
-ORBIT_KEEP_GAIN = 0.60
-# ② 径向阻尼：给纯 P 的径向回路加一个微分项，抑制半径来回摆。
-#    单位是秒。注意径向速度估计本身有一阶滤波（τ≈0.08s），会带来
-#    atan(0.08*ω) 的相位滞后，所以太小会没有净效果。
-#    实测径向振荡周期约 1.22s（ω≈5.15rad/s），相位收益是 atan(T*ω)：
-#    T=0.10 -> 净 +5°（几乎无效）、T=0.18 -> 净 +21°（本版取值）、
-#    T=0.30 -> 净 +35°（更硬，可再试）。上限是 LOOP_R/v≈0.72s，再大易变正反馈。
+# ===================== v10：绕圈径向阻尼（本轮唯一改动）=====================
+# 先把"实测"和"我之前的错判"分开写清楚，因为这轮改的是**增益**，不是半径。
+#
+# 实测成绩（project1.csv，按提交时间切分）：
+#   v8 (ddda28d)            n=6 中位 18.90 最好 17.36     <- 目前最好
+#   v9 全量 (58bdd47)       n=2 中位 20.98
+#   v9 贴柱软墙+阻尼 (76eb152) n=4 中位 19.60
+#   v9 小摆幅 (68c5058)      n=3 中位 20.09
+# 结论：我前面三轮绕圈改动**全部更慢**，已整体回退。回退后重查数据，找到了真正的问题。
+#
+# 【本轮发现】v9 那版"贴柱软墙+阻尼"没被单独测过；这次把成绩按提交时间切开：
+#   v8 (ddda28d)            n=6 中位 18.90 最好 17.36
+#   v9 全量 (58bdd47)       n=2 中位 20.98
+#   v9 贴柱软墙+阻尼 (76eb152) n=4 中位 19.60
+#   v9 小摆幅 (68c5058)      n=3 中位 20.09
+# 三轮绕圈改动全都更慢。逐个排除后，v9 那版里**真正有害的是贴柱软墙**：
+# 它把指令半径往外推（等效 +14mm）-> 路径变长 -> 变慢。这与"半径越大越慢"
+# 的几何事实一致，也和 v10 的离线模型一致：单降增益会把平均半径从 261 推到
+# 329（+26% 路径），同样是变慢的方向。
+# 所以本轮只保留**一个有明确理由、且不改变稳态**的那一半：径向阻尼。
+#
+# 为什么阻尼不会变慢：阻尼项正比于**径向速度**，稳态绕行时径向速度为零，
+# 所以它不改变稳态半径、也就没有路径长度代价；它只在"正在漂"的时候出手，
+# 用来压掉过冲。而贴柱软墙是正比于**半径偏差**的，会改变稳态，所以会变慢。
+# 这正好解释了 v9 两版的速度差异。
+#
+# 观感依据（用户："鱼尾一直不停摆、不丝滑"）：绕圈段修正量在 ±72° 之间来回打
+# （p2p 145°）、|航向误差| 中位数 28°、26% 的帧 >40°；而只用位置量算出的
+# "航迹方向 − 圆切向"虽均值为零，幅值却达 ±35°（p10~p90 = -35°~+38°）。
+# 这就是"一直在纠、一直在摆"的物理量；阻尼是唯一能在**不改稳态**的前提下
+# 把它的过冲压下去的手段。
+#
+# 取值：径向速度估计自身有一阶滤波（calculate 里 alpha = dt/(0.08+dt)，
+# τ≈0.08s），会吃掉 atan(0.08*ω) 的相位。实测振荡周期 1.22s（ω≈5.15rad/s）：
+#   T=0.10 -> 净领先仅 +5°（几乎无效）
+#   T=0.18 -> 净 +21°（本轮取值）
+#   T=0.30 -> 净 +35°（更硬，可再试）
+# 上限 LOOP_R/v≈0.72s，再大趋近正反馈。
+#
+# 安全含义：阻尼只在径向速度非零时改变航向指令，稳态与 v8 完全一致，
+# 所以"半径不退让、路径不变长"。v7 原有的 |e_r|>40 收推力兜底与 55mm
+# 几何间隙校验一律不动。
+# 验收（见 AGENTS.md 7.6）：(1) |gamma| 均值是否从 23° 下降；
+#   (2) orbit 段 stage_seconds 是否不比 v8 差；(3) 是否仍撞柱。
 ORBIT_RADIAL_DAMP = 0.18
-
-# ③ 绕圈段的摆尾幅值（最终发出去的角度，不再乘 TAIL_GAIN）。
-#    用户反馈："绕圈时鱼尾一直不停摆动，不够丝滑；一轮转弯应该是转完就笔直走。"
-#    实测印证——绕圈段的修正量（DC）会在 ±72° 之间来回打（p2p 145°），
-#    航向误差中位数 28°、26% 的帧超过 40°。也就是说尾巴**同时**在干两件事：
-#    大幅修正方向 + 大幅摆动推进，看起来就是"一直甩个不停"。
-#    而 v8 把绕圈段的摆幅从被截断的 ~10° 放开到 24°（为了把推进还回来），
-#    视觉上进一步放大了这个"甩"。本版把绕圈段换成更小的固定幅值：
-#      · 小：视觉上靠近"转完就走"的干脆感；
-#      · **固定**：不参与 min(amplitude, MAX_TAIL-|correction|) 的裁剪，
-#        所以不会出现"时而满幅、时而几乎没有"的抖动感（v7 那种被裁的样子）。
-#    DC 上限仍是 MAX_TAIL - 本幅值 = 65，所以摆幅永不被裁、也不越硬限幅。
-#    代价：绕圈推进量下降，该段可能变慢。若觉得太慢，把它调到 18；想要更快
-#    但更"甩"，调到 20~24（v8 的等效值）。
-ORBIT_TAIL_AMPLITUDE = 15.0
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -670,9 +654,6 @@ class RaceController:
         self.heading_error = 0.0
         self.course_slip = 0.0
         self.course_correction = 0.0
-        # v9：本帧绕圈观测量，仅供诊断/日志读取，不参与任何控制判断。
-        self.orbit_radius = float('nan')
-        self.orbit_eff_radius_error = float('nan')
         self.stage_started_at = None
         self.stage_seconds = {}
         self.finished = False
@@ -715,20 +696,19 @@ class RaceController:
                 return self._guidance(x, y)
             dx, dy = x-section.center[0], y-section.center[1]
             radius = math.hypot(dx, dy)
-            # v9：径向阻尼（纯 P -> PD）。v7 只有比例项，所以半径的径向回路
-            #   没有阻尼。这里的径向速度用 calculate 里已经算好的速度估计
-            #   （一阶滤波，τ≈0.08s），所以 T 要留出这份相位滞后的余量。
+            # v10：给纯 P 的径向回路补一个阻尼项（见常量块）。
+            #   只在径向速度非零时生效，所以**不改变稳态半径、不改变航向指令的
+            #   平均值**，没有路径长度代价；它压的是过冲与来回摆。
+            #   方向核对：径向速度用 calculate 里的速度估计投影到半径方向；
+            #   正在外漂(dr/dt>0) 时把 e_r 推得更大 -> 修正更强 -> 提前收。
             radial_speed = ((self.velocity_x*dx + self.velocity_y*dy) / radius
                             if radius > 1.0 else 0.0)
             radius_error = radius - LOOP_R + ORBIT_RADIAL_DAMP*radial_speed
-            # 贴柱保底（软墙）：越靠里，额外往外推得越多。方向核对——本回路的
-            #   期望航向偏移是 atan2(2*e_r, LOOP_R)，**e_r 越负越朝外**，
-            #   所以"往外推"必须把 e_r 减一个正值（写成加法方向就反了）。
-            if radius < ORBIT_KEEP_R:
-                radius_error -= ORBIT_KEEP_GAIN*(ORBIT_KEEP_R - radius)
-            self.orbit_radius = radius
-            self.orbit_eff_radius_error = radius_error
             # 圆的切向 + 径向误差反馈，比追前瞻弦更不易切入方柱角。
+            # 注意：这里**特意保持 v7/v8 的 P 项增益 atan2(2*e_r, LOOP_R) 不变**。
+            #   v10 试过把它降到参考实现的等效档（atan2(e_r, 250)，即 0.4 倍增益），
+            #   但离线模型显示那会把平均半径从 261 推到 329（+26% 路径）——同样是
+            #   变慢的方向，与 v9 实测"往外推就变慢"一致，故放弃。
             heading = math.atan2(dy, dx) + math.pi/2
             heading += math.atan2(2.0*radius_error, LOOP_R)
             return _wrap(heading), 1.0/LOOP_R, 1.0/LOOP_R
@@ -821,10 +801,6 @@ class RaceController:
         # v8：摆幅优先于修正量。DC 的上限由"硬限幅 - 本段摆幅"给出，于是摆幅
         #   **永不被裁**（v7 的 DC 限幅 62 会把绕圈段摆幅砍掉一半，见常量块④）。
         amplitude = amplitude * TAIL_GAIN
-        # v9：绕圈段改用更小的**固定**摆幅（见常量块③）。放在 TAIL_GAIN 之后覆盖，
-        #   所以这个数是最终发出去的度数，调参时不用再乘系数。
-        if not USE_STABLE_PROFILE and self.orbit is not None:
-            amplitude = ORBIT_TAIL_AMPLITUDE
         return thrust, frequency, amplitude, MAX_TAIL - amplitude
 
     def calculate(self, fish_info, now=None):
@@ -1233,16 +1209,12 @@ def self_test():
             self.assertLessEqual(hard, ORBIT_RECAPTURE_THRUST)
 
         def test_v8_tail_swing_never_truncated(self):
-            """v8 核心：DC 限幅必须为摆幅让位，尾摆不能被 DC 截断。
+            """v8 核心：DC 限幅必须为摆幅让位，尾摆不能再被裁掉。
 
             依据：对 Tail(t) 做单频最小二乘，绕圈段实测摆幅只有 10.2 / 9.4°，
             而未被裁的穿缝段是 20.9°——v7 的 `min(amp, 80-|correction|)`
             把绕圈段的摆尾砍掉一半，等于把推进关掉（该段速度中位仅 268~277）。
-            v9 进一步把绕圈幅值**单独取小且固定**（见 ORBIT_TAIL_AMPLITUDE），
-            所以这里只断言"不被截断、不越限幅"，不再要求它等于 TAIL 系列常量。
             """
-            if USE_STABLE_PROFILE:
-                return          # --stable 档保持与 v7 一致，不做绕圈改动
             c = RaceController()
             for curvature, error, x, y in ((1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R),
                                            (0.0, 0.0, -1100.0, 0.0)):
@@ -1255,135 +1227,68 @@ def self_test():
                 # 峰值不会越过平台硬限幅。
                 self.assertLessEqual(amplitude+dc_limit, MAX_TAIL+1e-9)
                 self.assertTrue(amplitude > 0.0)
-            # 绕圈段：固定值，且不小于"刚好把 DC 上限提到 65"所要求的 15。
+            # 绕圈段摆幅必须明显大于 v7 实测被裁后的 10.2°，也不再被裁。
             c.orbit = OrbitProgress(OBS1, 1)
             _, _, orbit_amp, _ = c._motion_profile(1.0/LOOP_R, 0.0, OBS1[0], -LOOP_R)
-            self.assertAlmostEqual(orbit_amp, ORBIT_TAIL_AMPLITUDE, places=6)
-            # 非绕圈段仍按 TAIL 系列（含 TAIL_GAIN）走，不受本项影响。
-            c.orbit = None
-            _, _, straight_amp, _ = c._motion_profile(0.0, 0.0, -1100.0, 0.0)
-            self.assertAlmostEqual(straight_amp,
-                                   TAIL_AMPLITUDE_STRAIGHT*TAIL_GAIN, places=6)
+            self.assertAlmostEqual(orbit_amp, TAIL_AMPLITUDE_TURN*TAIL_GAIN, places=6)
+            self.assertGreater(orbit_amp, 10.2)
 
-        def test_v9_orbit_tail_amplitude_is_small_and_fixed(self):
-            """绕圈摆幅必须"小且固定"——这是用户要的"转完就笔直走"的手感。
+        def test_v10_orbit_damping_does_not_change_the_steady_state(self):
+            """v10 的核心约束：阻尼项在稳态（径向速度为零）必须完全消失。
 
-            实测：绕圈段 DC 在 ±72° 来回打（p2p 145°），航向误差中位数 28°、
-            26% 的帧 >40°。幅值再叠 24° 就是"一直甩个不停"。
-            固定幅值的意义：不参与 min(amp, MAX_TAIL-|correction|)，所以不会
-            出现"时而满幅、时而几乎没有"的抖动观感（v7 被裁时的样子）。
+            这是"不会变慢"的保证：它不改变稳态半径，就没有路径长度代价。
+            对照 v9 的贴柱软墙——那项正比于半径偏差，会改变稳态，所以会变慢。
             """
-            if USE_STABLE_PROFILE:
-                return          # --stable 档保持与 v7 一致，不做绕圈改动
-            c = RaceController()
-            c.orbit = OrbitProgress(OBS1, 1)
-            # 固定：不随 heading error 变化。
-            amps = set()
-            for err in (0.0, 20.0, 60.0, 179.0, -179.0):
-                amps.add(round(c._motion_profile(1.0/LOOP_R, err,
-                                                 OBS1[0], -LOOP_R)[2], 9))
-            self.assertEqual(len(amps), 1, '绕圈幅值必须与航向误差无关')
-            self.assertAlmostEqual(amps.pop(), ORBIT_TAIL_AMPLITUDE, places=9)
-            # 小：要明显低于原有的转弯档幅值，才谈得上"干脆"。
-            self.assertLess(ORBIT_TAIL_AMPLITUDE,
-                            TAIL_AMPLITUDE_TURN*TAIL_GAIN)
-            # 足够给 DC 留出 65° 的修正上限（15 是这条的下限）。
-            self.assertGreaterEqual(MAX_TAIL-ORBIT_TAIL_AMPLITUDE, 65.0)
-
-        def test_v9_orbit_keep_floor_sits_above_the_geometric_limit(self):
-            """贴柱保底线必须留出真实的鱼体间隙，而不只是"数字上大于半对角"。
-
-            用最坏方向（柱角 45 度）算：柱子到半径 r 的最近距离是
-              clear(r) = sqrt(2)*max(r/sqrt(2) - 100, 0)
-            再减去鱼等效半宽 45 才是真间隙。
-              r=174.9（实测 orbit_3 最小）-> clear=33.5 -> 间隙 -11.5mm（撞进去）
-              r=186.4                        -> clear=45.0 -> 间隙  0.0mm（刚好贴上）
-              r=200.0（指令半径）             -> clear=58.6 -> 间隙 +13.6mm
-              r=214.0（本版保底线）           -> clear=72.6 -> 间隙 +27.6mm
-            """
-            def fish_margin(radius):
-                u = radius / math.sqrt(2.0)
-                return math.hypot(max(u-100.0, 0.0), max(u-100.0, 0.0)) - 45.0
-
-            self.assertAlmostEqual(PILLAR_HALF_DIAG, 141.5)
-            # 保底线必须明显高于"刚好贴上"的 186.4。
-            self.assertGreater(ORBIT_KEEP_R, PILLAR_HALF_DIAG + 45.0)
-            # "刚好贴上"的半径 ≈ 柱半对角 + 鱼半宽。注意 141.5 是四舍五入后的
-            # 半对角（真值 100*sqrt(2)=141.421），所以这里是近似等式。
-            self.assertLess(abs(fish_margin(PILLAR_HALF_DIAG + 45.0)), 0.1)
-            # 实测最小半径处确实是"撞进去"——这条保底线是需要的。
-            self.assertLess(fish_margin(174.9), 0.0)
-            # 保底线处要留出至少 20mm 的真实间隙。
-            self.assertGreaterEqual(fish_margin(ORBIT_KEEP_R), 20.0)
-
-        def test_v9_orbit_keep_floor_only_acts_when_too_close(self):
-            """保底软墙只在半径低于 ORBIT_KEEP_R 时生效，正常绕行逐位不变。"""
-            c = RaceController()
-            c.section_index = 1
-            c.orbit = OrbitProgress(OBS1, 1)
-
-            def effective_error(radius):
-                # 放在正南（theta=-90°），切向朝 +x。
-                c.velocity_x = c.velocity_y = 0.0
-                c._guidance(OBS1[0], OBS1[1] - radius)
-                return c.orbit_eff_radius_error
-
-            # 健康半径：必须有 proter 项，且逐位等于 radius - LOOP_R。
-            self.assertAlmostEqual(effective_error(230.0), 230.0 - LOOP_R, places=9)
-            self.assertAlmostEqual(effective_error(ORBIT_KEEP_R),
-                                   ORBIT_KEEP_R - LOOP_R, places=9)
-            # 刚越过保底线：开始往外推（等效误差被推得更负）。
-            below = effective_error(ORBIT_KEEP_R - 10.0)
-            self.assertLess(below, ORBIT_KEEP_R - 10.0 - LOOP_R)
-            # 越靠里推得越多。
-            self.assertLess(effective_error(190.0), effective_error(200.0))
-            # 实测最贴柱的 174.9 处：确实被"从往外推"接住（等效误差仍为负）。
-            self.assertLess(effective_error(174.9), 0.0)
-
-        def test_v9_radial_damping_only_on_orbits(self):
-            """径向阻尼只在绕圈段生效，非绕圈段不介入。"""
             if USE_STABLE_PROFILE:
                 return
             c = RaceController()
             c.section_index = 1
             c.orbit = OrbitProgress(OBS1, 1)
-            # 正南、半径 230：纯 P 项为正，只观察阻尼的增量。
-            x, y = OBS1[0], OBS1[1] - 230.0
-            c.velocity_x, c.velocity_y = 0.0, -120.0      # 径向往外
-            outward, _, _ = c._guidance(x, y)
-            c.velocity_y = 120.0                          # 径向往内
-            inward, _, _ = c._guidance(x, y)
-            c.velocity_y = 0.0
-            neutral, _, _ = c._guidance(x, y)
-            # 本回路：正角偏差=往内收。往外漂要提前收 -> 偏差变大。
-            self.assertGreater(outward, neutral)
-            self.assertLess(inward, neutral)
-            # 阻尼量级要落在"±30mm 等效半径误差"以内，不能盖过整条控制律。
-            self.assertLess(abs(outward - neutral), 30.0 * 2.0 / LOOP_R + 1e-6)
+            self.assertGreater(ORBIT_RADIAL_DAMP, 0.0)
+            # 稳态：径向速度为零 -> heading 就是纯切向 + 原有 P 项，与 v8 一致。
+            for deg in range(0, 360, 45):
+                x, y = _polar(OBS1[0], OBS1[1], LOOP_R, deg)
+                c.velocity_x = c.velocity_y = 0.0
+                heading, _, _ = c._guidance(x, y)
+                tangent = math.atan2(y-OBS1[1], x-OBS1[0]) + math.pi/2
+                self.assertAlmostEqual(_wrap(heading-tangent), 0.0, places=9)
+            # 半径偏离时仍按原 P 项修正（v8 的增益原样保留）。
+            for radius in (150.0, 180.0, 250.0, 300.0):
+                x, y = OBS1[0], OBS1[1] - radius
+                c.velocity_x = c.velocity_y = 0.0
+                heading, _, _ = c._guidance(x, y)
+                expected = _wrap(math.atan2(-radius, 0.0) + math.pi/2
+                                 + math.atan2(2.0*(radius-LOOP_R), LOOP_R))
+                self.assertAlmostEqual(heading, expected, places=9)
 
-        def test_v9_orbit_happy_path_matches_v7_guidance(self):
-            """回归保护：在目标半径上、无径向速度时，绕圈导引必须与 v7 逐位一致。
-
-            v7 的表达式是 heading = atan2(dy,dx) + pi/2 + atan2(2*(r-LOOP_R), LOOP_R)。
-            v9 的两项都在"半径健康且无径向漂移"时归零，所以结果必须相同。
-            这条保证"只稳 orbit_3、其它不变"不是口头承诺。
-            """
+        def test_v10_orbit_damping_opposes_drift(self):
+            """阻尼只在"正在漂"时出手：外漂提前收，内漂提前放。"""
+            if USE_STABLE_PROFILE:
+                return
             c = RaceController()
             c.section_index = 1
             c.orbit = OrbitProgress(OBS1, 1)
-            # 只比较"没触发软墙"的半径；低于 ORBIT_KEEP_R 时本就该不同。
-            for radius in (300.0, 250.0, ORBIT_KEEP_R):
-                for deg in range(0, 360, 30):
-                    x, y = _polar(OBS1[0], OBS1[1], radius, deg)
-                    dx, dy = x - OBS1[0], y - OBS1[1]
-                    c.velocity_x = c.velocity_y = 0.0
-                    heading, curv, signed = c._guidance(x, y)
-                    r = math.hypot(dx, dy)
-                    v7 = _wrap(math.atan2(dy, dx) + math.pi/2
-                               + math.atan2(2.0*(r-LOOP_R), LOOP_R))
-                    self.assertAlmostEqual(heading, v7, places=9)
-                    self.assertEqual(curv, 1.0/LOOP_R)
-                    self.assertEqual(signed, 1.0/LOOP_R)
+            x, y = OBS1[0], OBS1[1] - LOOP_R
+            c.velocity_x, c.velocity_y = 0.0, -120.0      # 径向往外
+            outward, _, _ = c._guidance(x, y)
+            c.velocity_x, c.velocity_y = 0.0, 120.0       # 径向往内
+            inward, _, _ = c._guidance(x, y)
+            c.velocity_x = c.velocity_y = 0.0
+            neutral, _, _ = c._guidance(x, y)
+            self.assertAlmostEqual(neutral, 0.0, places=9)
+            # 本回路：正角偏差=往内收。往外漂要提前收 -> 偏差变大。
+            self.assertGreater(outward, neutral)
+            self.assertLess(inward, neutral)
+            # 阻尼量级要有界，并与公式一致：
+            #   e_r 增量 = ORBIT_RADIAL_DAMP * 120 = 21.6mm
+            #   heading 增量 = +atan2(2*21.6, LOOP_R) = +12.19°
+            # 符号核对：在南极点(theta=-90°)时切向朝 +x，正的角偏量把期望航向
+            # 往 +y 转，即朝圆心 —— 外漂得到"朝内"的提前修正，正是阻尼要的方向。
+            expected = math.degrees(math.atan2(2.0*ORBIT_RADIAL_DAMP*120.0,
+                                               LOOP_R))
+            self.assertAlmostEqual(math.degrees(outward-neutral), expected,
+                                   places=9)
+            self.assertLess(abs(expected), 20.0)   # 不能盖过整条控制律
 
         def test_v8_tail_swing_survives_the_worst_heading_error(self):
             """修正量顶到上限时，摆幅仍必须按各段预算足额发出。
