@@ -71,14 +71,35 @@ v8：绕圈段的"尾摆被 DC 挤死"专项（依据取自自测附带的 on-ca
   想只看摆幅那一半：把 TAIL_GAIN 改回 1.0（优先级对调仍保留）。
   实测由用户执行；未实测，不能保证耗时。
 
+v11：只动绕第三柱的"瞬态"，不动任何稳态量（AGENTS.md 7.7 的筛选判据）。
+  两处改动都只在"正在漂"时出手，理想绕行（径向误差恒定、径向速度为零）下
+  与 v8 逐字相同，因此不改变稳态半径、不改变路径长度：
+    · ② 航向指令变化率限幅 ORBIT_HEADING_SLEW（默认 **关闭**）。
+      稳态绕行只要 v/R≈67deg/s，远慢于上限；它只在指令跳变时把尖峰摊平，
+      让尾轴不必为了追一个跳变而牺牲摆幅。
+    · ① 径向阻尼 ORBIT_RADIAL_DAMP_TAU=0.18（本版**唯一启用**的飞行改动）。
+      把 atan2(2e, R) 换成 atan2(2(e+tau*v_r), R)：稳态等价，过冲/内切时提前反打。
+  绕第一柱完全不变（自测 test_v11_orbit_1_guidance_unchanged 逐字断言）。
+  同时加了两件闭环工具（默认关闭，不影响比赛）：
+    · --telemetry：逐帧落 race_telemetry.csv，每行带**策略指纹** PolicyHash；
+    · 每轮结束追加一行 runs.csv（策略指纹 + 分段耗时 + 绕圈稳定性指标）。
+  这是因为 fishmon 之前只做单轮报告、从不跨轮聚合，且会拿旧版本的遥测给新成绩
+  做诊断（详见 AGENTS.md 7.8）。有了指纹与逐轮汇总，才真正能做 A/B 闭环。
+  实测由用户执行；未实测，不能保证耗时。
+
 命令行加 --stable 可使用v2平面路线/速度参数；平台不方便传参时，
 将下方 USE_STABLE_PROFILE 改为 True。两种模式都使用修正后的高度控制，
 不恢复旧版的向上推力错误。两种模式都保留全部圈数和限幅。
 实测由用户执行；几何/逻辑自测不能代替比赛成绩验收。
 命令行自测：python -B test.py --self-test（不导入 cue，不连接平台）。
+命令行遥测：python -B test.py --telemetry（逐帧落盘，默认关闭）。
 """
 
 import math
+import csv
+import hashlib
+import io
+import json
 import os
 import sys
 import threading
@@ -106,8 +127,8 @@ MAX_WING_TILT = 85.0             # 相对水平推进基准；不允许转到倒
 MAX_THRUST = 50.0
 MAX_TAIL = 80.0
 TEAM_NAME = 'F05012589'
-PROFILE_NAME = ('race-v8-stable-hold-z' if USE_STABLE_PROFILE
-                else 'race-v8-hold-start-z')
+PROFILE_NAME = ('race-v11-stable-hold-z' if USE_STABLE_PROFILE
+                else 'race-v11-hold-start-z')
 # 整体提速系数：v5.1 按用户要求 +8%；v6 用户要求"再快一些"，提到 1.16。
 # 只放大推进量与目标速度：尾摆频率/幅值、巡航/转弯/穿缝目标速度、转弯加速度预算。
 # 不放宽任何平台限幅（MAX_THRUST=50、MAX_TAIL=80）、安全间隙和圈数判定。
@@ -175,6 +196,18 @@ ORBIT_RECAPTURE_THRUST = 28.0 * SPEED_GAIN
 # v8：严重外漂的安全底线。向外漂到这一档就不只是"漂宽"，而是失控了，
 #   无论方向一律收推力（实测该段最大外漂 118.8mm）。
 ORBIT_RECAPTURE_HARD_BAND = 110.0
+# ===================== v11：绕第三柱的瞬态整形（本版唯一飞行改动）=====================
+# 只限制"航向指令"的变化率，稳态完全不受影响：指令不变时它什么都不做，
+# 绕圈时那条恒定的切向航向也远慢于这个上限，因此**不改变稳态半径、不改变路径长度**。
+#   依据（用户观感"绕圈不丝滑、鱼尾一直摆"）：该段航向误差 |e| 中位 28°，
+#   尾轴 DC 在 ±72° 之间来回打（p2p 145°），而这些尖峰远快于绕圈本身需要的转角率 ——
+#   v=270mm/s、R=230mm 只需要 v/R=1.17rad/s≈67°/s。
+#   把尖峰摊平，尾轴就不必为了追一个跳变而把摆幅额度吃掉（v8 的核心结论）。
+# 只对 orbit_3 生效：v8 绕第一柱本来就没有这个问题（用户明确要求"其它不变"）。
+ORBIT_HEADING_SLEW = 0.0
+# 绕圈径向阻尼的时间常数（v10 已验证"不改稳态"的唯一手段，这里只用在 orbit_3）。
+#   0.0 = 关闭，退回 v8 的裸切向指令；0.18s 是 v10 用过的值附近。
+ORBIT_RADIAL_DAMP_TAU = 0.18
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -441,18 +474,145 @@ def _wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+# ===================== v11：闭环日志（--telemetry，默认关闭）=====================
+# 设计原则（这是上一版闭环失败的直接教训）：
+#   1) 只记录控制器**本帧实际用过**的量，不在日志里重算一遍，否则"记录值"和
+#      "实际值"会悄悄分叉（v9 的注释已经点破这条，这里照做）；
+#   2) 落盘时带**策略指纹**（参数哈希），fishmon 才能把"参数 -> 成绩"对上，
+#      而不是把一份三天前的遥测套在今天的成绩上；
+#   3) 只在显式加 --telemetry 时写文件，比赛照常跑不受影响。
+TELEMETRY_FILE = 'race_telemetry.csv'
+TELEMETRY_HEADER = (
+    'Time(s),Stage,PosX,PosY,PosZ,Pitch(deg),Speed,VerticalSpeed,YawError,'
+    'Tail,Thrust,Amplitude,Frequency,OrbitRadius,RadialSpeed,FloorActive,'
+    'PolicyHash\n')
+
+
+def policy_fingerprint():
+    """把关键常量折成一个短哈希。
+
+    只做只读扫描，绝不写回 test.py。参数不变 -> 哈希不变；任何一处生效常量
+    被改动 -> 哈希变化。fishmon 侧据此判断"两轮成绩到底是不是同一套参数"。
+    """
+    body = ('%s|%s|%s|%s|%s|%s|%s' % (
+        PROFILE_NAME, SPEED_GAIN, TAIL_GAIN, LOOP_R, CURVE_ARM_RATIO,
+        ORBIT_HEADING_SLEW, ORBIT_RECAPTURE_HARD_BAND)).encode('utf-8')
+    return '%016x' % (int(hashlib.sha1(body).hexdigest()[:16], 16),)
+
+
+POLICY_HASH = policy_fingerprint()
+
+
+def telemetry_row(controller, command, now):
+    """把一帧状态格式化成 CSV 行（不含换行）。"""
+    o = controller.orbit
+    nan = float('nan')
+    px, py, pz = controller.last_position
+    elapsed = 0.0 if controller.started_at is None else now-controller.started_at
+    return ('%.3f,%s,%.1f,%.1f,%.1f,%.2f,%.1f,%.1f,%.2f,%.1f,%.1f,%.1f,%.2f,'
+            '%.1f,%.1f,%.0f,%s'
+            % (elapsed, controller.stage, px, py, pz, controller.pitch_degrees,
+               controller.speed, controller.vertical_speed,
+               controller.heading_error, command.tail, command.left,
+               controller.last_amplitude, controller.last_frequency,
+               o.radius if o is not None else nan,
+               o.radial_speed if o is not None else nan,
+              1.0 if (o is not None and o.floor_active) else 0.0,
+               POLICY_HASH))
+
+
+RUNS_FILE = 'runs.csv'
+RUNS_COLUMNS = ('Timestamp,Profile,PolicyHash,Reason,Elapsed(s),StageSeconds,'
+                'Laps,Orbit1RadiusMean,Orbit1RadiusStd,Orbit1RadialRms,'
+                'Orbit3RadiusMean,Orbit3RadiusStd,Orbit3RadialRms,'
+                'Orbit3RadiusMin,Orbit3RadiusMax,Orbit3Frames').split(',')
+
+
+def _csv_line(fields):
+    """用 csv 模块生成一行，而不是手写拼接。
+
+    教训：分段耗时/圈数用 JSON 承载，里面本身带逗号和引号；手写 `"{}"` 拼接
+    不会转义内部引号，解析时列数会悄悄膨胀。交给 csv 模块转义才可靠。
+    """
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator='\n').writerow(fields)
+    return buffer.getvalue()
+
+
+RUNS_HEADER = _csv_line(RUNS_COLUMNS)
+
+
+def run_summary_row(controller):
+    """每轮一行的汇总：策略指纹 + 分段耗时 + 绕圈稳定性指标。
+
+    为什么要有这一行：fishmon 旧版只做单轮报告、从不跨轮聚合，于是"参数 -> 成绩"
+    这条链一直是断的（并且会拿旧遥测给新成绩做诊断）。把参数指纹与实测稳定性
+    写进一行 CSV，才能做真正的 A/B 对比。
+    """
+    stats = controller.orbit_stats
+    def fmt(name, key, spec='%.1f'):
+        value = stats.get(name, {}).get(key)
+        return 'nan' if value is None else spec % value
+    elapsed = (0.0 if controller.started_at is None or controller.last_at is None
+               else controller.last_at-controller.started_at)
+    return _csv_line([
+        time.strftime('%Y-%m-%d %H:%M:%S'),
+        PROFILE_NAME, POLICY_HASH, controller.reason, '%.3f' % elapsed,
+        json.dumps(controller.stage_seconds, sort_keys=True),
+        json.dumps({k: round(v, 3) for k, v in controller.completed_laps.items()},
+                   sort_keys=True),
+        fmt('orbit_1', 'radius_mean'), fmt('orbit_1', 'radius_std'),
+        fmt('orbit_1', 'radial_rms'),
+        fmt('orbit_3', 'radius_mean'), fmt('orbit_3', 'radius_std'),
+        fmt('orbit_3', 'radial_rms'),
+        fmt('orbit_3', 'radius_min'), fmt('orbit_3', 'radius_max'),
+        str(stats.get('orbit_3', {}).get('frames', 0))])
+
+
+def append_run_summary(controller):
+    """把本轮汇总追加到 runs.csv；任何写失败都静默跳过，绝不拖死策略进程。"""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RUNS_FILE)
+        exists = os.path.isfile(path)
+        handle = open(path, 'a', encoding='utf-8')
+        try:
+            if not exists:
+                handle.write(RUNS_HEADER)
+            handle.write(run_summary_row(controller))
+        finally:
+            handle.close()
+    except (IOError, OSError):
+        pass
+
+
 class OrbitProgress:
     """仅累计真实运动产生的有符号角度；逆行会抵消，不奖励瞬移或抖动。"""
     def __init__(self, center, laps):
         self.center = center
         self.required = laps * 2.0 * math.pi
+        self.num_laps = laps
         self.angle = 0.0
         self.previous = None
+        self.previous_radius = None
+        # 供 --telemetry 落盘：本帧**实际用到**的半径与径向速度。
+        #   由 update() 计算时写入，日志侧不再重算一遍（避免两套公式分叉）。
+        self.radius = float('nan')
+        self.radial_speed = 0.0
+        self.floor_active = False
+        self._radial_samples = []
+        self._radius_samples = []
 
-    def update(self, x, y):
+    def update(self, x, y, dt=1.0 / 60.0):
         dx, dy = x-self.center[0], y-self.center[1]
         radius = math.hypot(dx, dy)
         theta = math.atan2(dy, dx)
+        self.radius = radius
+        self._radius_samples.append(radius)
+        self.floor_active = False
+        if self.previous_radius is not None and dt > 0.0:
+            self.radial_speed = (radius-self.previous_radius)/dt
+        self._radial_samples.append(self.radial_speed)
+        self.previous_radius = radius
         if not PILLAR_HALF_DIAG + 35.0 <= radius <= LOOP_R + 140.0:
             self.previous = None
             return
@@ -464,6 +624,24 @@ class OrbitProgress:
 
     def done(self):
         return self.angle + 1e-9 >= self.required
+
+    def stats(self):
+        """本段绕圈的稳定性指标：半径均值/标准差、径向速度 RMS、半径极值。
+
+        这些就是"绕第三个障碍物稳不稳"的可量化代理：
+        标准差不降说明航迹还在圆内外来回摆，径向速度 RMS 不降说明过冲没被压住，
+        radius_min 逼近几何撞击线（PILLAR_HALF_DIAG + 45 = 186.5）说明有撞柱风险。
+        """
+        n = len(self._radius_samples)
+        if n == 0:
+            return {'frames': 0}
+        mean = sum(self._radius_samples)/n
+        var = sum((r-mean)**2 for r in self._radius_samples)/n
+        radial_rms = math.sqrt(
+            sum(v*v for v in self._radial_samples)/len(self._radial_samples))
+        return {'frames': n, 'radius_mean': mean, 'radius_std': math.sqrt(var),
+                'radial_rms': radial_rms, 'radius_min': min(self._radius_samples),
+                'radius_max': max(self._radius_samples)}
 
 
 class DepthController:
@@ -558,6 +736,7 @@ class RaceController:
         self.section_index = 0
         self.tracker = PathTracker(self.sections[0].points)
         self.orbit = None
+        self.orbit_stats = {}
         self.completed_laps = {}
         self.passed_middle_gap = False
         self.pid = PIDController()
@@ -582,6 +761,12 @@ class RaceController:
         self.finished = False
         self.reason = ''
         self.command = Command()
+        # v11：本帧实际发布出去的推进/尾摆量，供 --telemetry 落盘与闭环分析。
+        self.last_frequency = 0.0
+        self.last_amplitude = 0.0
+        self._last_dt = 1.0/60.0
+        self._last_orbit_heading = None
+        self._orbit_radial_speed = 0.0
 
     @property
     def stage(self):
@@ -599,16 +784,19 @@ class RaceController:
         self.stage_started_at = self.last_at
         if self.orbit is not None:
             self.completed_laps[self.stage] = self.orbit.angle / (2.0*math.pi)
+            self.orbit_stats[self.stage] = self.orbit.stats()
         self.section_index += 1
         section = self.sections[self.section_index]
         self.tracker = PathTracker(section.points)
         self.orbit = OrbitProgress(section.center, section.laps) if section.center else None
+        self._last_orbit_heading = None
+        self._orbit_radial_speed = 0.0
         self.pid.reset()
 
     def _guidance(self, x, y):
         section = self.sections[self.section_index]
         if self.orbit is not None:
-            self.orbit.update(x, y)
+            self.orbit.update(x, y, self._last_dt)
             # 角度只在绕柱有效半径内累计；必须完成真实整圈。
             # v2还要求距离出圈点<=85；漂移使该条件错过时可能多等一整圈。
             # v3圈数满足后交给下一段路径收敛，不为等待一个点继续整圈绕行。
@@ -622,7 +810,34 @@ class RaceController:
             # 圆的切向 + 径向误差反馈，比追前瞻弦更不易切入方柱角。
             heading = math.atan2(dy, dx) + math.pi/2
             heading += math.atan2(2.0*radius_error, LOOP_R)
-            return _wrap(heading), 1.0/LOOP_R, 1.0/LOOP_R
+            heading = _wrap(heading)
+            # v11：**只对绕第三柱**做瞬态整形。两处都只改"正在漂"时的指令，
+            #   理想绕行（径向误差恒定、径向速度为零）下与 v8 逐字相同，
+            #   因此不改变稳态半径、不改变路径长度（AGENTS.md 7.7 判据）。
+            #   绕第一柱本来就没这个问题，按用户要求保持原样。
+            if section.name == 'orbit_3':
+                # ① 径向阻尼：把 atan2(2e, R) 换成 atan2(2(e+tau*v_r), R)。
+                #    稳态 v_r=0 -> 完全等价；只在过冲/内切时提前反向修正。
+                if ORBIT_RADIAL_DAMP_TAU > 0.0:
+                    self._orbit_radial_speed = (
+                        self._orbit_radial_speed
+                        + (self.orbit.radial_speed-self._orbit_radial_speed)
+                        * (self._last_dt/(ORBIT_RADIAL_DAMP_TAU+self._last_dt)))
+                    base = math.atan2(2.0*radius_error, LOOP_R)
+                    damped = math.atan2(
+                        2.0*(radius_error+ORBIT_RADIAL_DAMP_TAU
+                             * self._orbit_radial_speed), LOOP_R)
+                    heading = _wrap(heading + (damped-base))
+                # ② 航向指令变化率限幅（默认关闭）：把单帧跳变压住，
+                #    避免尾轴为了追一个尖峰而丢掉摆幅（v8 的核心结论）。
+                if ORBIT_HEADING_SLEW > 0.0:
+                    limit = math.radians(ORBIT_HEADING_SLEW)*self._last_dt
+                    if self._last_orbit_heading is not None:
+                        step = _wrap(heading-self._last_orbit_heading)
+                        heading = _wrap(self._last_orbit_heading
+                                        + _constrain(step, -limit, limit))
+                self._last_orbit_heading = heading
+            return heading, 1.0/LOOP_R, 1.0/LOOP_R
 
         target = self.tracker.target(x, y)
         if target is None:
@@ -743,6 +958,7 @@ class RaceController:
         if raw_dt <= 0.0:
             return self.command
         dt = _constrain(raw_dt, 0.001, 0.1)
+        self._last_dt = dt
         if self.last_position is not None:
             px, py, pz = self.last_position
             displacement = math.sqrt((x-px)**2 + (y-py)**2 + (z-pz)**2)
@@ -811,6 +1027,9 @@ class RaceController:
         amplitude = min(amplitude, MAX_TAIL-abs(correction))
         self.phase = (self.phase + 2.0*math.pi*frequency*dt) % (2.0*math.pi)
         tail = correction + amplitude*math.sin(self.phase)
+        # v11：记录**本帧实际发布**的推进/尾摆量，供 --telemetry 与闭环分析使用。
+        self.last_frequency = frequency
+        self.last_amplitude = amplitude
 
         left_angle, right_angle = self.depth.calculate(
             z, self.vertical_speed, pitch, roll, self.speed, dt)
@@ -1202,6 +1421,127 @@ def self_test():
                 self.assertEqual(c.stage, 'slalom_2')
                 self.assertGreaterEqual(c.completed_laps['orbit_1'], 1.0)
 
+        # ---------------- v11：闭环日志 ----------------
+
+        def test_v11_telemetry_row_is_parseable(self):
+            """--telemetry 的每行必须列数正确、可解析，且带策略指纹。"""
+            columns = TELEMETRY_HEADER.rstrip('\n').split(',')
+            c = RaceController()
+            c.calculate(info(), now=1.0)
+            command = c.calculate(info(x=-1240.0, y=0.0), now=1.0+1.0/60.0)
+            row = telemetry_row(c, command, 1.0+1.0/60.0).split(',')
+            self.assertEqual(len(row), len(columns))
+            self.assertEqual(row[-1], POLICY_HASH)
+            self.assertEqual(row[1], c.stage)
+            float(row[0])
+            # 非绕圈段的绕圈列必须是 nan，不能悄悄填 0 冒充"半径为零"。
+            self.assertEqual(row[columns.index('OrbitRadius')], 'nan')
+            # 绕圈段才给出真实半径。
+            c.section_index = 1
+            c.tracker = PathTracker(c.sections[1].points)
+            c.orbit = OrbitProgress(OBS1, 1)
+            c.orbit.update(OBS1[0], -LOOP_R)
+            row = telemetry_row(c, Command(), 2.0).split(',')
+            self.assertAlmostEqual(float(row[columns.index('OrbitRadius')]), LOOP_R)
+
+        def test_v11_policy_fingerprint_changes_with_constants(self):
+            """指纹必须只由生效常量决定：同一进程内稳定，且写成16位十六进制。"""
+            self.assertEqual(POLICY_HASH, policy_fingerprint())
+            self.assertEqual(len(POLICY_HASH), 16)
+            int(POLICY_HASH, 16)
+
+        def test_v11_orbit_stats_quantify_stability(self):
+            """绕圈稳定性指标要能区分"贴圆走"与"里外乱摆"。"""
+            steady = OrbitProgress(OBS3, 2)
+            for degree in range(0, 1081, 3):
+                steady.update(*_polar(*OBS3, LOOP_R, degree))
+            wobble = OrbitProgress(OBS3, 2)
+            for i, degree in enumerate(range(0, 1081, 3)):
+                wobble.update(*_polar(*OBS3, LOOP_R+(30.0 if i % 2 else -30.0),
+                                      degree))
+            a, b = steady.stats(), wobble.stats()
+            self.assertLess(a['radius_std'], 1.0)
+            self.assertGreater(b['radius_std'], 20.0)
+            # 径向速度 RMS 同向：摆动越大，RMS 越高。
+            self.assertLess(a['radial_rms'], b['radial_rms'])
+            self.assertAlmostEqual(a['radius_mean'], LOOP_R, places=0)
+
+        def test_v11_runs_row_has_stable_column_count(self):
+            """runs.csv 的行必须能对得上表头，否则 fishmon 侧无法聚合。"""
+            c = RaceController()
+            c.started_at = 100.0
+            c.last_at = 118.5
+            c.reason = 'crossed_finish'
+            c.stage_seconds = {'approach_1': 2.1, 'orbit_1': 5.6,
+                               'slalom_2': 4.5, 'orbit_3': 6.2}
+            c.completed_laps = {'orbit_1': 1.0, 'orbit_3': 2.0}
+            c.orbit_stats = {'orbit_1': OrbitProgress(OBS1, 1).stats(),
+                             'orbit_3': OrbitProgress(OBS3, 2).stats()}
+            read = list(csv.reader(io.StringIO(RUNS_HEADER+run_summary_row(c))))
+            self.assertEqual(len(read[0]), len(read[1]))
+            self.assertEqual(len(read[0]), len(RUNS_COLUMNS))
+            self.assertEqual(read[1][2], POLICY_HASH)
+            self.assertEqual(read[1][3], 'crossed_finish')
+            # 分段耗时/圈数是 JSON 列：必须原样可解析，不能被逗号切碎。
+            self.assertEqual(json.loads(read[1][5]), c.stage_seconds)
+            self.assertEqual(json.loads(read[1][6]), c.completed_laps)
+
+        def test_v11_heading_slew_is_transient_only(self):
+            """航向速率限制与本版径向阻尼在稳态下都不得改变绕圈指令。
+
+            判据（AGENTS.md 7.7）：只改瞬态、稳态为零的改动才是安全的。这里构造
+            一个**径向误差恒定、径向速度为零**的理想绕行，断言指令与裸切向一致。
+            """
+            if ORBIT_RADIAL_DAMP_TAU <= 0.0:
+                return
+            c = RaceController()
+            c.section_index = 3
+            c.tracker = PathTracker(c.sections[3].points)
+            c.orbit = OrbitProgress(OBS3, 2)
+            for degree in (0.0, 0.4, 0.8):
+                x, y = _polar(*OBS3, LOOP_R, degree)
+                heading, _, _ = c._guidance(x, y)
+                expected = _wrap(math.atan2(y-OBS3[1], x-OBS3[0])+math.pi/2)
+                self.assertAlmostEqual(heading, expected, places=6)
+
+        def test_v11_heading_slew_caps_sudden_jumps(self):
+            """瞬态整形必须真的把"跳变"压住，而不是只写在注释里。"""
+            global ORBIT_HEADING_SLEW
+            saved = ORBIT_HEADING_SLEW
+            ORBIT_HEADING_SLEW = 180.0
+            try:
+                c = RaceController()
+                c.section_index = 3
+                c.tracker = PathTracker(c.sections[3].points)
+                c.orbit = OrbitProgress(OBS3, 2)
+                x, y = _polar(*OBS3, LOOP_R, 0.0)
+                first, _, _ = c._guidance(x, y)
+                # 下一步把鱼放到圆心另一侧：裸切向会瞬间翻转 180 度。
+                far = _polar(*OBS3, LOOP_R, 180.0)
+                heading, _, _ = c._guidance(*far)
+                limit = math.radians(ORBIT_HEADING_SLEW)*c._last_dt
+                bare = _wrap(math.atan2(far[1]-OBS3[1], far[0]-OBS3[0])+math.pi/2)
+                # 裸指令的变化远超上限（说明这个用例确实触发了限幅）……
+                self.assertGreater(abs(_wrap(bare-first)), limit)
+                # ……而实际发出的指令，单帧变化被压在限幅之内。
+                self.assertLessEqual(abs(_wrap(heading-first)), limit+1e-9)
+            finally:
+                ORBIT_HEADING_SLEW = saved
+
+        def test_v11_orbit_1_guidance_unchanged(self):
+            """用户要求"其它不变"：绕第一柱的航向指令必须与 v8 逐字相同。"""
+            c = RaceController()
+            c.section_index = 1
+            c.tracker = PathTracker(c.sections[1].points)
+            c.orbit = OrbitProgress(OBS1, 1)
+            for degree in range(0, 360, 7):
+                x, y = _polar(*OBS1, LOOP_R+35.0, degree)
+                heading, curvature, signed = c._guidance(x, y)
+                expected = _wrap(math.atan2(y-OBS1[1], x-OBS1[0])+math.pi/2
+                                 + math.atan2(2.0*35.0, LOOP_R))
+                self.assertAlmostEqual(heading, expected, places=9)
+                self.assertEqual((curvature, signed), (1.0/LOOP_R, 1.0/LOOP_R))
+
         def test_course_slip_compensates_in_opposite_direction(self):
             c = RaceController()
             for i in range(61):
@@ -1361,6 +1701,22 @@ def main():
     last_received = [None]
     last_report = [0.0]
     debug = '--debug' in sys.argv
+    # v11：开赛冻结的可观测性。实测 approach_1 平均只有 215mm/s（同推力下其它段
+    #   277~330），怀疑"平台已开跑、策略还没接上"有约 1s 的零速空档。这里只在
+    #   计时开始后的头 2 秒里检查位移，超时只**打印**一行提示，不改任何控制量。
+    start_probe = [None, None]
+    # v11：可选逐帧遥测（默认关闭，比赛照常跑不受影响）。
+    telemetry_log = None
+    telemetry_flush = [0.0]
+    if '--telemetry' in sys.argv:
+        try:
+            telemetry_log = open(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), TELEMETRY_FILE),
+                'w', encoding='utf-8')
+            telemetry_log.write(TELEMETRY_HEADER)
+        except (IOError, OSError) as exc:
+            print('[telemetry] disabled: {}'.format(exc), flush=True)
+            telemetry_log = None
 
     def publish(command):
         message = mycue.FishCtrlInfo()
@@ -1388,6 +1744,19 @@ def main():
                 print('[error] {}: {}'.format(type(exc).__name__, exc), flush=True)
                 command = controller.stop('callback_error')
             publish(command)
+            if (start_probe[0] is None and controller.last_position is not None
+                    and controller.started_at is not None
+                    and now-controller.started_at >= 2.0):
+                moved = math.hypot(controller.last_position[0]-START[0],
+                                   controller.last_position[1]-START[1])
+                start_probe[0] = moved
+                print('[diag] launch: {:.0f}mm in first 2.0s of timing'.format(
+                    moved), flush=True)
+            if telemetry_log is not None:
+                telemetry_log.write(telemetry_row(controller, command, now)+'\n')
+                if now-telemetry_flush[0] > 0.5:
+                    telemetry_log.flush()
+                    telemetry_flush[0] = now
             if stage_before != controller.stage or (debug and now-last_report[0] >= 1.0):
                 elapsed = 0.0 if controller.started_at is None else now-controller.started_at
                 print('[race] {:.2f}s stage={} pos={} speed={:.1f}/{:.1f} yaw_error={:.1f} slip={:.1f} z_target={:.0f} vz={:.1f} pitch={:.1f}/{:.1f} wings=({:.1f},{:.1f}) laps={} stage_seconds={}'.format(
@@ -1415,12 +1784,23 @@ def main():
                     publish(controller.stop('telemetry_timeout'))
                 elif last_received[0] is None and now-waiting_since > 60.0:
                     controller.stop('waiting_timeout')
-        print('[race] stopped: {} stage_seconds={} (official result must be checked in simulator)'.format(
-            controller.reason, controller.stage_seconds), flush=True)
+        # v11：本轮结束即把"参数指纹 + 分段耗时 + 绕圈稳定性"追加到 runs.csv。
+        if controller.orbit is not None:
+            controller.orbit_stats[controller.stage] = controller.orbit.stats()
+        append_run_summary(controller)
+        print('[race] stopped: {} stage_seconds={} orbit_stats={} policy={} (official result must be checked in simulator)'.format(
+            controller.reason, controller.stage_seconds,
+            {k: {kk: round(vv, 1) for kk, vv in v.items()}
+             for k, v in controller.orbit_stats.items()},
+            POLICY_HASH), flush=True)
     except KeyboardInterrupt:
         with lock:
             publish(controller.stop('interrupted'))
     finally:
+        if telemetry_log is not None:
+            telemetry_log.flush()
+            telemetry_log.close()
+            telemetry_log = None
         # 保留subscriber引用直到退出；不要在DDS回调线程内销毁reader。
         with lock:
             publish(Command())

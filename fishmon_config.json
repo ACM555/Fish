@@ -37,6 +37,8 @@
   "process_rescan_gap_sec": 3.0,
   "thread_fallback_refresh_sec": 30.0,
   "restart_trial_on_update": true,
+  "traceable_runs_file": "runs.csv",
+  "mark_stale_telemetry": true,
   "log_paths": [
     "WindowsNoEditor/Fish427/Binaries/Win64/fish_race.log"
   ],

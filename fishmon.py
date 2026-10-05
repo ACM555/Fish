@@ -32,6 +32,9 @@ fishmon.py —— 水中机器鱼「科目一 障碍竞速」低开销监控与�
   · 迭代速率（控制回调 Hz、监控采样 Hz）
   · 瓶颈定位：分段耗时、速度利用率、绕圈径向误差触发的推力回收
   · 提速建议 + **候选补丁**（含依据与风险；本工具不会自动改 test.py）
+  · **遥测可信度**：标注 race_telemetry.csv 是否属于本轮（未跑完/过期的旧数据会
+    被显式点名，避免拿旧遥测给新成绩做诊断）
+  · **跨轮聚合**：读 test.py 每轮追加的 runs.csv，按策略指纹给出中位/最好/最差
 """
 
 import argparse
@@ -892,7 +895,7 @@ def read_scores(path):
 
 
 def read_telemetry(path):
-    """读 race_telemetry.csv（v7.2 起由 test.py 自动写）。返回 list[dict]。"""
+    """读 race_telemetry.csv（v11 起由 `test.py --telemetry` 显式落盘）。返回 list[dict]。"""
     if not os.path.isfile(path):
         return []
     try:
@@ -900,6 +903,112 @@ def read_telemetry(path):
             return list(csv.DictReader(handle))
     except (IOError, OSError, UnicodeDecodeError, ValueError):
         return []
+
+
+def telemetry_provenance(path, scores):
+    """判断 race_telemetry.csv 到底属于哪一轮、是不是**已经过期**的旧数据。
+
+    背景（必须记住的教训）：本工具以前每轮都读同一个 race_telemetry.csv，却从不
+    校验它是谁写的。结果 2026-10-05 的两份报告读的是 09-28 18:59 由 v7.6.2 写的
+    一份**没跑完**的遥测，把它的分段耗时/速度原样当成当天的实测，得出了错误结论。
+    这里给出「遥测时间戳 + 与最新成绩的时间差 + 策略指纹」三件证据，报告里显式
+    标注是否可信，避免再用旧数据给新成绩做诊断。
+    """
+    out = {'path': path, 'exists': os.path.isfile(path)}
+    if not out['exists']:
+        return out
+    out['mtime'] = os.path.getmtime(path)
+    out['mtime_text'] = datetime.fromtimestamp(
+        out['mtime']).strftime('%Y-%m-%d %H:%M')
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            rows = list(csv.DictReader(handle))
+        out['frames'] = len(rows)
+        if rows:
+            stages = []
+            for r in rows:
+                stage = r.get('Stage', '')
+                if not stages or stages[-1] != stage:
+                    stages.append(stage)
+            out['stages'] = stages
+            out['last_stage'] = stages[-1] if stages else ''
+            hashes = [r.get('PolicyHash') for r in rows if r.get('PolicyHash')]
+            out['policy_hash'] = hashes[-1] if hashes else ''
+            # 是否跑完：只要没走到 finish 就是中途数据（可能撞柱/超时/被中断）。
+            out['complete'] = 'finish' in stages or 'crossed_finish' in stages
+            t = []
+            for r in rows:
+                try:
+                    t.append(float(r.get('Time(s)', 'nan')))
+                except (TypeError, ValueError):
+                    pass
+            if t:
+                out['t_last'] = t[-1]
+    except (IOError, OSError, UnicodeDecodeError, ValueError):
+        pass
+    # 与最新成绩的时间差：遥测早于最新的有效成绩，就说明它不属于那一轮。
+    latest = [s for _, s, _ in scores if s is not None]
+    if latest and 'mtime' in out:
+        out['latest_score'] = latest[-1]
+    return out
+
+
+def read_runs(path):
+    """读 test.py v11 每轮追加的 runs.csv（策略指纹 + 分段耗时 + 绕圈稳定性）。
+
+    这是「参数 -> 成绩」的聚合表。旧版 fishmon 只做单轮报告、从不跨轮聚合，
+    所以一直无法回答"哪个参数组合更快"，这里把它补上。
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            rows = [r for r in csv.DictReader(handle) if r.get('PolicyHash')]
+    except (IOError, OSError, UnicodeDecodeError, ValueError):
+        return []
+    out = []
+    for r in rows:
+        def num(key):
+            try:
+                return float(r.get(key, 'nan'))
+            except (TypeError, ValueError):
+                return None
+        out.append({
+            'stamp': r.get('Timestamp', ''),
+            'profile': r.get('Profile', ''),
+            'hash': r.get('PolicyHash', ''),
+            'reason': r.get('Reason', ''),
+            'elapsed': num('Elapsed(s)'),
+            'stage_seconds': r.get('StageSeconds', ''),
+            'orbit3_std': num('Orbit3RadiusStd'),
+            'orbit3_rms': num('Orbit3RadialRms'),
+            'orbit3_min': num('Orbit3RadiusMin'),
+            'orbit3_mean': num('Orbit3RadiusMean'),
+        })
+    return out
+
+
+def aggregate_runs(runs):
+    """按策略指纹分组，给每组算轮次/中位/最好/最差——真正可比的 A/B 表。"""
+    groups = {}
+    for r in runs:
+        if r['elapsed'] is None:
+            continue
+        groups.setdefault(r['hash'], []).append(r)
+    out = []
+    for digest, items in groups.items():
+        times = sorted(i['elapsed'] for i in items)
+        n = len(times)
+        median = times[n//2] if n % 2 else (times[n//2-1]+times[n//2])/2.0
+        stds = [i['orbit3_std'] for i in items if i['orbit3_std'] is not None]
+        out.append({
+            'hash': digest, 'profile': items[-1]['profile'], 'runs': n,
+            'median': median, 'best': times[0], 'worst': times[-1],
+            'orbit3_std_mean': (sum(stds)/len(stds)) if stds else None,
+            'last': items[-1]['stamp'],
+        })
+    out.sort(key=lambda g: g['median'])
+    return out
 
 
 def analyse_telemetry(rows):
@@ -1224,8 +1333,9 @@ def detect_bottlenecks(sysstat, tel, scores, cfg):
     else:
         findings.append((
             'warn', '没有拿到逐帧遥测',
-            '未找到 race_telemetry.csv。它是 v7.2 起 test.py 自动写的；'
-            '若你的 test.py 更旧，跑一次最新版即可生成，能大幅提高诊断精度。'))
+            '未找到 race_telemetry.csv。注意：**它不是自动写的**——'
+            'test.py 只有显式加 `--telemetry` 才会落盘（v11 起每行带策略指纹）；'
+            '用 `python -B test.py --telemetry` 跑一轮即可生成，能大幅提高诊断精度。'))
 
     if scores:
         recent = [s for _, s, _ in scores if s is not None][-8:]
@@ -1235,6 +1345,47 @@ def detect_bottlenecks(sysstat, tel, scores, cfg):
                 '最近 {} 次有效成绩 {} s，最好 {:.2f}s，平均 {:.2f}s。'.format(
                     len(recent), [round(v, 2) for v in recent],
                     min(recent), sum(recent) / len(recent))))
+    # 遥测可信度：这是本工具最容易骗自己的地方（见 telemetry_provenance 的注释）。
+    prov = tel.get('provenance') or {}
+    if tel.get('available') and prov:
+        if not prov.get('complete', True):
+            findings.append((
+                'high', '逐帧遥测不属于本轮（未跑完的旧数据）',
+                'race_telemetry.csv 最后一段是 `{}`（t={:.2f}s），**没有跑到 finish**，'
+                '写盘时间 {}。这说明它是某次中途失败/被中断的旧数据，'
+                '**不要**用它的分段耗时和速度给本轮成绩做诊断；'
+                '请用 `--telemetry` 重跑一轮带策略指纹的遥测。'.format(
+                    prov.get('last_stage', '?'), prov.get('t_last', 0.0),
+                    prov.get('mtime_text', '?'))))
+        else:
+            findings.append((
+                'info', '逐帧遥测来源',
+                '文件写盘时间 {}，{} 帧，策略指纹 `{}`，跑到 `{}`。'
+                '若与最新成绩的时间对不上，说明它不是同一轮。'.format(
+                    prov.get('mtime_text', '?'), prov.get('frames', 0),
+                    prov.get('policy_hash') or '（旧版无指纹）',
+                    prov.get('last_stage', '?'))))
+    # 跨轮聚合：只有 runs.csv 存在时才能做真正的 A/B。
+    runs = tel.get('runs') or []
+    groups = aggregate_runs(runs) if runs else []
+    if groups:
+        best = groups[0]
+        findings.append((
+            'info', '参数 -> 成绩 跨轮聚合（前 3）',
+            '；'.join('`{}`（{} 轮，中位 {:.2f}s，最好 {:.2f}s，'
+                      'orbit_3 半径σ均值 {}）'.format(
+                          g['hash'], g['runs'], g['median'], g['best'],
+                          'n/a' if g['orbit3_std_mean'] is None
+                          else '{:.1f}mm'.format(g['orbit3_std_mean']))
+                      for g in groups[:3])))
+    elif runs:
+        findings.append(('warn', 'runs.csv 里没有可汇总的轮次',
+                         '文件存在但没有带耗时的有效行。'))
+    else:
+        findings.append((
+            'warn', '没有跨轮聚合表 runs.csv',
+            'test.py v11 起每轮结束会追加一行 runs.csv（策略指纹 + 分段耗时 + '
+            '绕圈稳定性）。没有它就只能看单轮报告，无法比较不同参数的优劣。'))
     return findings
 
 
@@ -1893,6 +2044,9 @@ def run(args, cfg):
         scores = read_scores(resolve('WindowsNoEditor/Scripts/project1.csv'))
         tel_rows = read_telemetry(os.path.join(HERE, 'race_telemetry.csv'))
         tel = analyse_telemetry(tel_rows)
+        tel['provenance'] = telemetry_provenance(
+            os.path.join(HERE, 'race_telemetry.csv'), scores)
+        tel['runs'] = read_runs(os.path.join(HERE, 'runs.csv'))
         tel['orbit'] = analyse_orbit_deviation(tel_rows, cfg)
         sysstat = analyse_system(sampler.samples)
         findings = detect_bottlenecks(sysstat, tel, scores, cfg)

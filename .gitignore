@@ -13,5 +13,9 @@ Thumbs.db
 # 每次运行覆盖写的遥测，属于运行时产物，不入库
 race_telemetry.csv
 
+# v11：每轮一行的参数/成绩/绕圈稳定性汇总（保留是因为要跨轮做 A/B 对比），
+# 但这属于本机运行时产物，不入库。
+runs.csv
+
 # fishmon 监控工具的产物（报告与逐帧 CSV），属于运行时产物
 monitor_reports/
