@@ -71,18 +71,19 @@ v8：绕圈段的"尾摆被 DC 挤死"专项（依据取自自测附带的 on-ca
   想只看摆幅那一半：把 TAIL_GAIN 改回 1.0（优先级对调仍保留）。
   实测由用户执行；未实测，不能保证耗时。
 
-v11：只动绕第三柱的"瞬态"，不动任何稳态量（AGENTS.md 7.7 的筛选判据）。
-  两处改动都只在"正在漂"时出手，理想绕行（径向误差恒定、径向速度为零）下
-  与 v8 逐字相同，因此不改变稳态半径、不改变路径长度：
-    · ② 航向指令变化率限幅 ORBIT_HEADING_SLEW（默认 **关闭**）。
-      稳态绕行只要 v/R≈67deg/s，远慢于上限；它只在指令跳变时把尖峰摊平，
-      让尾轴不必为了追一个跳变而牺牲摆幅。
-    · ① 径向阻尼 ORBIT_RADIAL_DAMP_TAU=0.18（本版**唯一启用**的飞行改动）。
-      把 atan2(2e, R) 换成 atan2(2(e+tau*v_r), R)：稳态等价，过冲/内切时提前反打。
-  绕第一柱完全不变（自测 test_v11_orbit_1_guidance_unchanged 逐字断言）。
-  同时加了两件闭环工具（默认关闭，不影响比赛）：
+v11：**飞行行为 = v8（按用户要求）**，本版实际生效的是观测层。
+  两个绕圈旋钮都写好并**默认关闭**，随时可开、开不开都进策略指纹：
+    · ORBIT_RADIAL_DAMP_TAU：径向阻尼，atan2(2e,R) -> atan2(2(e+tau*v_r),R)。
+      稳态等价、只压过冲；要"绕第三柱更稳"就改成 0.18。
+    · ORBIT_HEADING_SLEW：航向指令变化率限幅，把单帧跳变摊平。
+  两者都只改瞬态（理想绕行下与 v8 逐字相同），绕第一柱完全不变
+  （自测 test_v11_orbit_1_guidance_unchanged 逐字断言）。
+  **已验证**：2014 帧、绕完 1+2 圈的全阶段轨迹上，当前输出与 v8 逐帧 0 处差异；
+  把 tau 临时打开会出现 585 处差异，证明该轨迹确实会触发阻尼（不是空转）。
+  观测层（默认关闭，不影响比赛）：
     · --telemetry：逐帧落 race_telemetry.csv，每行带**策略指纹** PolicyHash；
-    · 每轮结束追加一行 runs.csv（策略指纹 + 分段耗时 + 绕圈稳定性指标）。
+    · 每轮结束追加一行 runs.csv（策略指纹 + 分段耗时 + 绕圈稳定性指标）；
+    · --diag：打印起跑后 2 秒位移，判断是否有"平台已跑、策略没接上"的空档。
   这是因为 fishmon 之前只做单轮报告、从不跨轮聚合，且会拿旧版本的遥测给新成绩
   做诊断（详见 AGENTS.md 7.8）。有了指纹与逐轮汇总，才真正能做 A/B 闭环。
   实测由用户执行；未实测，不能保证耗时。
@@ -206,8 +207,10 @@ ORBIT_RECAPTURE_HARD_BAND = 110.0
 # 只对 orbit_3 生效：v8 绕第一柱本来就没有这个问题（用户明确要求"其它不变"）。
 ORBIT_HEADING_SLEW = 0.0
 # 绕圈径向阻尼的时间常数（v10 已验证"不改稳态"的唯一手段，这里只用在 orbit_3）。
-#   0.0 = 关闭，退回 v8 的裸切向指令；0.18s 是 v10 用过的值附近。
-ORBIT_RADIAL_DAMP_TAU = 0.18
+#   **按用户要求回滚到 ddda28d（v8）：本项关闭，飞行行为与 v8 逐字相同。**
+#   想要"绕第三柱更稳"就把这一行改成 0.18（或 0.10/0.30 对比），
+#   它会同时出现在 runs.csv 的策略指纹里，便于 A/B 归因。
+ORBIT_RADIAL_DAMP_TAU = 0.0
 # 曲率限速的下限；实际路径最大曲率远达不到该下限触发点，仅为常量尺度一致。
 TURN_SPEED_FLOOR = 250.0 * SPEED_GAIN
 # 出缝后内切曲线的控制臂长度（相对绕行半径）。0.85R 让曲率上限约 1/217，
@@ -494,9 +497,10 @@ def policy_fingerprint():
     只做只读扫描，绝不写回 test.py。参数不变 -> 哈希不变；任何一处生效常量
     被改动 -> 哈希变化。fishmon 侧据此判断"两轮成绩到底是不是同一套参数"。
     """
-    body = ('%s|%s|%s|%s|%s|%s|%s' % (
+    body = ('%s|%s|%s|%s|%s|%s|%s|%s' % (
         PROFILE_NAME, SPEED_GAIN, TAIL_GAIN, LOOP_R, CURVE_ARM_RATIO,
-        ORBIT_HEADING_SLEW, ORBIT_RECAPTURE_HARD_BAND)).encode('utf-8')
+        ORBIT_HEADING_SLEW, ORBIT_RADIAL_DAMP_TAU,
+        ORBIT_RECAPTURE_HARD_BAND)).encode('utf-8')
     return '%016x' % (int(hashlib.sha1(body).hexdigest()[:16], 16),)
 
 
@@ -1445,10 +1449,25 @@ def self_test():
             self.assertAlmostEqual(float(row[columns.index('OrbitRadius')]), LOOP_R)
 
         def test_v11_policy_fingerprint_changes_with_constants(self):
-            """指纹必须只由生效常量决定：同一进程内稳定，且写成16位十六进制。"""
+            """指纹必须只由生效常量决定：稳定、16位十六进制，且覆盖两个绕圈旋钮。
+
+            尤其是 ORBIT_RADIAL_DAMP_TAU：它默认 0.0，但一旦被打开就会改变
+            飞行行为。如果指纹不包含它，runs.csv 里两轮哈希相同，A/B 归因就断了
+            （这正是本项目上一版闭环失败的同类问题）。
+            """
+            global ORBIT_RADIAL_DAMP_TAU
             self.assertEqual(POLICY_HASH, policy_fingerprint())
             self.assertEqual(len(POLICY_HASH), 16)
             int(POLICY_HASH, 16)
+            saved = ORBIT_RADIAL_DAMP_TAU
+            try:
+                for value in (0.18, 0.30):
+                    ORBIT_RADIAL_DAMP_TAU = value
+                    self.assertNotEqual(policy_fingerprint(), POLICY_HASH)
+                ORBIT_RADIAL_DAMP_TAU = saved
+                self.assertEqual(policy_fingerprint(), POLICY_HASH)
+            finally:
+                ORBIT_RADIAL_DAMP_TAU = saved
 
         def test_v11_orbit_stats_quantify_stability(self):
             """绕圈稳定性指标要能区分"贴圆走"与"里外乱摆"。"""
@@ -1701,10 +1720,11 @@ def main():
     last_received = [None]
     last_report = [0.0]
     debug = '--debug' in sys.argv
-    # v11：开赛冻结的可观测性。实测 approach_1 平均只有 215mm/s（同推力下其它段
-    #   277~330），怀疑"平台已开跑、策略还没接上"有约 1s 的零速空档。这里只在
-    #   计时开始后的头 2 秒里检查位移，超时只**打印**一行提示，不改任何控制量。
+    # 开赛冻结的可观测性（只打印，不改任何控制量）。实测 approach_1 平均只有
+    #   215mm/s（同推力下其它段 277~330），疑为"平台已开跑、策略还没接上"的
+    #   零速空档。想在比赛里看这条，就显式加 --diag；默认关闭以保持输出干净。
     start_probe = [None, None]
+    launch_diag = '--diag' in sys.argv
     # v11：可选逐帧遥测（默认关闭，比赛照常跑不受影响）。
     telemetry_log = None
     telemetry_flush = [0.0]
@@ -1744,7 +1764,8 @@ def main():
                 print('[error] {}: {}'.format(type(exc).__name__, exc), flush=True)
                 command = controller.stop('callback_error')
             publish(command)
-            if (start_probe[0] is None and controller.last_position is not None
+            if (launch_diag and start_probe[0] is None
+                    and controller.last_position is not None
                     and controller.started_at is not None
                     and now-controller.started_at >= 2.0):
                 moved = math.hypot(controller.last_position[0]-START[0],
